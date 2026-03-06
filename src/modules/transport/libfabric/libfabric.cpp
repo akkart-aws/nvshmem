@@ -22,6 +22,8 @@
 #include <unordered_map>
 #include <errno.h>
 #include <sched.h>
+
+#include "nvshmem_libfabric_tracepoint.h"
 #ifdef NVSHMEM_X86_64
 #include <immintrin.h>  // IWYU pragma: keep
 #endif
@@ -218,6 +220,7 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
     if (entry->flags & FI_REMOTE_CQ_DATA) {
         nvshmemt_libfabric_imm_cq_data_hdr_t imm_header =
             nvshmemt_get_write_with_imm_hdr(entry->data);
+        NVSHMEM_TRACE_REMOTE_DATA_ARRIVAL(ep->domain_index, (int)imm_header);
         if (NVSHMEMT_LIBFABRIC_IMM_PUT_SIGNAL_SEQ == imm_header ||
             NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT == imm_header ||
             NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ == imm_header) {
@@ -225,6 +228,7 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
             goto out;
         } else if (NVSHMEMT_LIBFABRIC_IMM_STAGED_ATOMIC_ACK == imm_header ||
                    NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK == imm_header) {
+            NVSHMEM_TRACE_PUT_SIGNAL_ACK_COMPLETION(ep->domain_index, (uint64_t)*addr);
             nvshmemt_libfabric_put_signal_ack_completion(state, ep, entry, *addr);
             goto out;
         } else {
@@ -240,16 +244,20 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
     op->src_addr = *addr;
 
     if (entry->flags & FI_SEND) {
+        NVSHMEM_TRACE_COMPLETION_SEND(ep->domain_index, (uint64_t)entry->op_context);
         state->op_queue[ep->domain_index]->putToSend(op);
         ep->completed_ops++;
     } else if (entry->flags & FI_RMA) {
+        NVSHMEM_TRACE_COMPLETION_WRITE(ep->domain_index, (uint64_t)entry->op_context);
         /* inlined p ops or atomic responses */
         state->op_queue[ep->domain_index]->putToSend(op);
         ep->completed_ops++;
     } else if ((op->type == NVSHMEMT_LIBFABRIC_MATCH) && (entry->flags & FI_RECV)) {
         /* Must happen after entry->flags & FI_SEND to avoid send completions */
+        NVSHMEM_TRACE_COMPLETION_SIGNAL(ep->domain_index, addr ? (uint64_t)*addr : 0, 0);
         status = nvshmemt_libfabric_put_signal_completion(transport, ep, entry, addr);
     } else if (entry->flags & FI_RECV) {
+        NVSHMEM_TRACE_COMPLETION_AMO(ep->domain_index, (uint64_t)entry->op_context);
         op->ep = ep;
         if (op->type == NVSHMEMT_LIBFABRIC_ACK) {
             status = nvshmemt_libfabric_gdr_process_ack(transport, op);
@@ -275,6 +283,7 @@ out:
 static int nvshmemt_libfabric_single_ep_progress(nvshmem_transport_t transport,
                                                  nvshmemt_libfabric_endpoint_t *ep) {
     nvshmemt_libfabric_state_t *state = (nvshmemt_libfabric_state_t *)transport->state;
+    NVSHMEM_TRACE_PROGRESS_START(ep->domain_index, 0);
     int max_per_poll = (state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA)
                            ? MAX_COMPLETIONS_PER_CQ_POLL_EFA
                            : MAX_COMPLETIONS_PER_CQ_POLL;
@@ -316,9 +325,12 @@ static int nvshmemt_libfabric_single_ep_progress(nvshmem_transport_t transport,
 
         NVSHMEMI_WARN_PRINT("Received a CQE with error. RC: %d. Error: %d (%s)", err_entry.err, err_entry.prov_errno,
                             fi_cq_strerror(ep->cq, err_entry.prov_errno, err_entry.err_data, NULL, 0));
+        NVSHMEM_TRACE_PROGRESS_END(ep->domain_index, NVSHMEMX_ERROR_INTERNAL);
+        
         return NVSHMEMX_ERROR_INTERNAL;
     }
 
+    NVSHMEM_TRACE_PROGRESS_END(ep->domain_index, 0);
     return 0;
 }
 
@@ -507,6 +519,7 @@ int gdrcopy_amo_ack(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t
 
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to write atomic ack.\n");
     ep->submitted_ops++;
+    NVSHMEM_TRACE_GDRCOPY_AMO_ACK(pe, ep->domain_index, sequence_count);
 
 out:
     return status;
@@ -524,6 +537,7 @@ int perform_gdrcopy_amo(nvshmem_transport_t transport, nvshmemt_libfabric_gdr_op
     nvshmemt_libfabric_memhandle_info_t *handle_info;
     volatile T *ptr;
     int status = 0;
+    NVSHMEM_TRACE_PERFORM_GDRCOPY_AMO_START(op->ep->domain_index, received_op->op);
     /* Save op fields as registers to allow posting op as RX before TX */
     int src_pe = op->send_amo.src_pe;
     nvshmemt_libfabric_endpoint_t *ep = op->ep;
@@ -615,6 +629,7 @@ int perform_gdrcopy_amo(nvshmem_transport_t transport, nvshmemt_libfabric_gdr_op
     }
 
 out:
+    NVSHMEM_TRACE_PERFORM_GDRCOPY_AMO_END(op->ep->domain_index, status);
     return status;
 }
 
@@ -1032,6 +1047,8 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
     remote_handle = &((nvshmemt_libfabric_mem_handle_t *)remote->handle)->hdls[ep->domain_index];
     op_size = bytesdesc.elembytes * bytesdesc.nelems;
 
+    NVSHMEM_TRACE_RMA_IMPL(pe, ep->domain_index, op_size, verb.desc, (uint64_t)remote->ptr);
+
     if (verb.desc == NVSHMEMI_OP_P) {
         if (libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA) {
             nvshmemt_libfabric_gdr_op_ctx_t *p_buf =
@@ -1376,6 +1393,7 @@ static int nvshmemt_libfabric_amo(struct nvshmem_transport *transport, int pe, v
     if (status) goto out;  // Status set by try_again
 
     ep->submitted_ops++;
+    NVSHMEM_TRACE_GDR_AMO(pe, ep->domain_index, verb.desc);
 
 out:
     if (status) {
@@ -1430,6 +1448,7 @@ static int nvshmemt_libfabric_gdr_signal(struct nvshmem_transport *transport, in
         status = NVSHMEMX_ERROR_INTERNAL;
     } else {
         ep->submitted_ops += 2;
+        NVSHMEM_TRACE_GDR_SIGNAL(pe, ep->domain_index, sequence_count, num_writes);
     }
 
 out:
