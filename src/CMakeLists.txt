@@ -625,6 +625,11 @@ if(NVSHMEM_LIBFABRIC_SUPPORT)
                    modules/transport/common/transport_gdr_common.cpp
     )
   endif()
+  if(CMAKE_C_FLAGS MATCHES "NVSHMEM_LIBFABRIC_TRACE")
+    target_include_directories(nvshmem_transport_libfabric PRIVATE modules/transport/libfabric)
+    target_sources(nvshmem_transport_libfabric PRIVATE modules/transport/libfabric/nvshmem_libfabric_trace.c)
+    target_link_libraries(nvshmem_transport_libfabric PRIVATE lttng-ust)
+  endif()
   set(ACTIVE_TRANSPORTS ${ACTIVE_TRANSPORTS} nvshmem_transport_libfabric)
 endif()
 
