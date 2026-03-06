@@ -2016,6 +2016,7 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
             NVSHMEMI_NULL_ERROR_JMP(state->op_queue[i], status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
                                     "Unable to alloc thread-safe op queue struct.\n");
             state->op_queue.back()->putToSendBulk((char *)state->send_buf[i], elem_size, num_sends);
+            state->op_queue.back()->set_auto_progress(use_auto_progress);
         }
 
         status = fi_av_open(domain, &av_attr, &address, NULL);
