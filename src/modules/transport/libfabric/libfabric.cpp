@@ -785,8 +785,16 @@ static int nvshmemt_libfabric_quiet(struct nvshmem_transport *tcurr, int pe, int
         for (;;) {
             all_quieted = true;
             for (int i = ep_start_idx; i < ep_end_idx; i++) {
-                const nvshmemt_libfabric_endpoint_t &ep = *(libfabric_state->eps[i]);
+                nvshmemt_libfabric_endpoint_t &ep = *(libfabric_state->eps[i]);
+
+                /* Quick out if the endpoint is still quiet since last time */
+                if (ep.submitted_ops == ep.completed_ctr) {
+                    continue;
+                }
+
                 completed = fi_cntr_read(ep.counter) + ep.completed_staged_atomics;
+                ep.completed_ctr = completed;
+
                 if (ep.submitted_ops != completed) all_quieted = false;
             }
             if (all_quieted) break;
