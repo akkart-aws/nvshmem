@@ -64,7 +64,6 @@
 
 /* Forward declarations */
 static int nvshmemt_libfabric_gdr_process_amos(nvshmem_transport_t transport, int qp_index);
-static int nvshmemt_libfabric_gdr_process_amos_ack(nvshmem_transport_t transport, int qp_index);
 static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
                                                     nvshmemt_libfabric_endpoint_t &ep,
                                                     struct fi_cq_data_entry *entry,
@@ -436,6 +435,31 @@ static inline bool is_signal_only_op(nvshmemi_amo_t op) {
             op == NVSHMEMI_AMO_SIGNAL_ADD);
 }
 
+inline int nvshmemt_libfabric_gdr_process_ack(nvshmem_transport_t transport,
+                                       nvshmemt_libfabric_gdr_op_ctx_t *op) {
+    nvshmemt_libfabric_gdr_ret_amo_op_t *ret = &op->ret_amo;
+    nvshmemt_libfabric_state_t *libfabric_state = (nvshmemt_libfabric_state_t *)transport->state;
+    nvshmemt_libfabric_memhandle_info_t *handle_info;
+    g_elem_t *elem;
+    void *valid_cpu_ptr;
+
+    handle_info = (nvshmemt_libfabric_memhandle_info_t *)nvshmemt_mem_handle_cache_get(
+        transport, libfabric_state->cache, ret->ret_addr);
+    if (!handle_info) {
+        NVSHMEMI_ERROR_PRINT("Unable to get handle info for atomic response.\n");
+        return NVSHMEMX_ERROR_INTERNAL;
+    }
+
+    valid_cpu_ptr =
+        (void *)((char *)handle_info->cpu_ptr + ((char *)ret->ret_addr - (char *)handle_info->ptr));
+    assert(valid_cpu_ptr);
+    elem = (g_elem_t *)valid_cpu_ptr;
+    elem->data = ret->elem.data;
+    elem->flag = ret->elem.flag;
+
+    return 0;
+}
+
 static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transport,
                                                      nvshmemt_libfabric_endpoint_t &ep,
                                                      struct fi_cq_data_entry *entry,
@@ -483,7 +507,14 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
     } else if (entry->flags & FI_RECV) {
         op->ep_index = ep.ep_index;
         if (op->type == NVSHMEMT_LIBFABRIC_ACK) {
-            state->op_queue[domain_idx]->putToRecv(op, NVSHMEMT_LIBFABRIC_RECV_TYPE_ACK);
+            status = nvshmemt_libfabric_gdr_process_ack(transport, op);
+            NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+                                "Unable to process atomic.\n");
+
+            status = fi_recv(ep.endpoint, (void *)op, NVSHMEM_STAGED_AMO_WIREDATA_SIZE,
+                            fi_mr_desc(state->mrs[domain_idx]), FI_ADDR_UNSPEC, &op->ofi_context);
+            NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+                                "Unable to re-post recv.\n");
         } else {
             state->op_queue[domain_idx]->putToRecv(op, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
         }
@@ -595,14 +626,6 @@ static int nvshmemt_libfabric_process_completions(nvshmem_transport_t transport,
     else
         status = nvshmemt_libfabric_manual_progress(transport);
 
-    nvshmemt_libfabric_state_t *libfabric_state = (nvshmemt_libfabric_state_t *)transport->state;
-    if (libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA) {
-        status = nvshmemt_libfabric_gdr_process_amos_ack(transport, qp_index);
-        if (status) {
-            return NVSHMEMX_ERROR_INTERNAL;
-        }
-    }
-
     return status;
 }
 static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_index) {
@@ -650,30 +673,6 @@ static int nvshmemt_libfabric_gdr_process_amo(nvshmem_transport_t transport,
 
 out:
     return status;
-}
-
-static int nvshmemt_libfabric_gdr_process_ack(nvshmem_transport_t transport,
-                                              nvshmemt_libfabric_gdr_op_ctx_t *op) {
-    nvshmemt_libfabric_gdr_ret_amo_op_t *ret = &op->ret_amo;
-    nvshmemt_libfabric_state_t *libfabric_state = (nvshmemt_libfabric_state_t *)transport->state;
-    nvshmemt_libfabric_memhandle_info_t *handle_info;
-    g_elem_t *elem;
-    void *valid_cpu_ptr;
-
-    handle_info = (nvshmemt_libfabric_memhandle_info_t *)nvshmemt_mem_handle_cache_get(
-        transport, libfabric_state->cache, ret->ret_addr);
-    if (!handle_info) {
-        NVSHMEMI_ERROR_PRINT("Unable to get handle info for atomic response.\n");
-        return NVSHMEMX_ERROR_INTERNAL;
-    }
-
-    valid_cpu_ptr =
-        (void *)((char *)handle_info->cpu_ptr + ((char *)ret->ret_addr - (char *)handle_info->ptr));
-    assert(valid_cpu_ptr);
-    elem = (g_elem_t *)valid_cpu_ptr;
-    elem->data = ret->elem.data;
-    elem->flag = ret->elem.flag;
-    return 0;
 }
 
 static int nvshmemt_libfabric_gdr_process_amos_ack(nvshmem_transport_t transport, int qp_index) {
