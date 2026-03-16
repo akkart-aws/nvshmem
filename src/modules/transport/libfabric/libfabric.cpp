@@ -881,7 +881,7 @@ static int nvshmemt_libfabric_quiet(struct nvshmem_transport *tcurr, int pe, int
     for (;;) {
         all_nics_quieted = true;
         for (int i = qp_index; i < end_iter; i++) {
-            if (state->eps[i]->submitted_ops != state->eps[i]->completed_ops) {
+            if (state->eps[i]->submitted_ops != state->eps[i]->completed_ops + state->eps[i]->completed_staged_atomics) {
                 all_nics_quieted = false;
                 if (nvshmemt_libfabric_progress(tcurr, qp_index)) {
                     status = NVSHMEMX_ERROR_INTERNAL;
@@ -1071,6 +1071,7 @@ static int nvshmemt_libfabric_rma(struct nvshmem_transport *tcurr, int pe, rma_v
         if (seq_counter.put_count >= NVSHMEM_STAGED_AMO_PUT_ACK_FREQ) {
             header = NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ;
             seq_counter.put_count = 0;
+            ep->submitted_ops++;  // Account for incoming ack
         } else {
             header = NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT;
         }
@@ -1151,7 +1152,7 @@ static int nvshmemt_libfabric_gdr_amo(struct nvshmem_transport *transport, int p
         NVSHMEMI_ERROR_PRINT("Received an error when trying to post an AMO operation.\n");
         status = NVSHMEMX_ERROR_INTERNAL;
     } else {
-        ep->submitted_ops++;
+        ep->submitted_ops += 2;
     }
 
 out:
@@ -1349,7 +1350,7 @@ static int nvshmemt_libfabric_gdr_signal(struct nvshmem_transport *transport, in
         NVSHMEMI_ERROR_PRINT("Received an error when trying to post a signal operation.\n");
         status = NVSHMEMX_ERROR_INTERNAL;
     } else {
-        ep->submitted_ops++;
+        ep->submitted_ops += 2;
     }
 
 out:
