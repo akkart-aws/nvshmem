@@ -623,6 +623,7 @@ typedef struct {
     int max_nic_per_pe;
     int num_selected_devs;
     int num_selected_domains;
+    uint64_t num_selected_domains_reciprocal;  /* precomputed for fast division */
     int cur_proxy_ep_index;
 
     /* Required for staged_amo */

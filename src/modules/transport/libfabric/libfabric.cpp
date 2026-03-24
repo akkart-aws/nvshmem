@@ -142,13 +142,11 @@ static inline int convert_addr_to_pe(nvshmemt_libfabric_state_t *state,
                                      nvshmemt_libfabric_endpoint_t *ep,
                                      fi_addr_t addr)
 {
-    // addr = pe * libfabric_state->num_selected_domains + ep->domain_index
-    // so
-    // pe = (addr - ep->domain_index) / (libfabric_state->num_selected_domains)
     int base_ep_index = addr - ep->domain_index;
     assert((base_ep_index % state->num_selected_domains) == 0);
 
-    return base_ep_index / state->num_selected_domains;
+    /* Fast division via precomputed reciprocal: multiply-shift by 32 */
+    return (int)(((uint64_t)(unsigned)base_ep_index * state->num_selected_domains_reciprocal) >> 32);
 }
 
 static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_state_t *state,
@@ -298,9 +296,7 @@ out:
 static int nvshmemt_libfabric_single_ep_progress(nvshmem_transport_t transport,
                                                  nvshmemt_libfabric_endpoint_t *ep) {
     nvshmemt_libfabric_state_t *state = (nvshmemt_libfabric_state_t *)transport->state;
-    int max_per_poll = (state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA)
-                           ? MAX_COMPLETIONS_PER_CQ_POLL_EFA
-                           : MAX_COMPLETIONS_PER_CQ_POLL;
+    static constexpr int max_per_poll = MAX_COMPLETIONS_PER_CQ_POLL;
     char buf[max_per_poll * sizeof(struct fi_cq_data_entry)];
     fi_addr_t src_addr[max_per_poll];
     fi_addr_t *addr;
@@ -708,19 +704,15 @@ int nvshmemt_libfabric_gdr_process_amo(nvshmem_transport_t transport,
                                        uint32_t sequence_count) {
     int status = 0;
 
-    switch (op->send_amo.size) {
-        case 2:
-            status = perform_gdrcopy_amo<uint16_t>(transport, op, send_elems, sequence_count);
-            break;
-        case 4:
-            status = perform_gdrcopy_amo<uint32_t>(transport, op, send_elems, sequence_count);
-            break;
-        case 8:
-            status = perform_gdrcopy_amo<uint64_t>(transport, op, send_elems, sequence_count);
-            break;
-        default:
-            NVSHMEMI_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-                               "invalid element size encountered %u\n", op->send_amo.size);
+    if (likely(op->send_amo.size == 8)) {
+        status = perform_gdrcopy_amo<uint64_t>(transport, op, send_elems, sequence_count);
+    } else if (op->send_amo.size == 4) {
+        status = perform_gdrcopy_amo<uint32_t>(transport, op, send_elems, sequence_count);
+    } else if (op->send_amo.size == 2) {
+        status = perform_gdrcopy_amo<uint16_t>(transport, op, send_elems, sequence_count);
+    } else {
+        NVSHMEMI_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+                           "invalid element size encountered %u\n", op->send_amo.size);
     }
 
 out:
@@ -1836,6 +1828,9 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
             NVSHMEMT_LIBFABRIC_MAX_NIC_PER_PE);
     }
     state->num_selected_domains = state->num_selected_devs + 1;
+    /* Precompute reciprocal: (2^32 + d - 1) / d, for fast division by multiply-shift */
+    state->num_selected_domains_reciprocal =
+        (UINT64_C(0x100000000) + state->num_selected_domains - 1) / state->num_selected_domains;
 
     /* Initialize configuration which only need to be set once */
     t->max_op_len = UINT64_MAX; /* Set as sential value */
