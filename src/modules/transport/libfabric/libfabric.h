@@ -521,10 +521,45 @@ class threadSafeOpQueue {
     }
 };
 
+/**
+ * Per-PE ring buffer for completion map entries, indexed by sequence number.
+ * Replaces std::unordered_map<uint64_t, comp_entry> for O(1) lookup/insert/erase
+ * with no hashing overhead.
+ */
+struct nvshmemt_libfabric_per_pe_comp_ring {
+    static constexpr uint32_t RING_SIZE = 4096;
+    static constexpr uint32_t RING_MASK = RING_SIZE - 1;
+    static_assert((RING_SIZE & RING_MASK) == 0, "RING_SIZE must be power of 2");
+
+    nvshmemt_libfabric_comp_entry_t entries[RING_SIZE];
+    bool occupied[RING_SIZE];
+
+    nvshmemt_libfabric_per_pe_comp_ring() { memset(occupied, 0, sizeof(occupied)); }
+
+    uint32_t idx(uint32_t seq) const { return seq & RING_MASK; }
+
+    void insert(uint32_t seq, const nvshmemt_libfabric_comp_entry_t &entry) {
+        uint32_t i = idx(seq);
+        assert(!occupied[i] && "Ring buffer collision: too many outstanding ops per PE");
+        entries[i] = entry;
+        occupied[i] = true;
+    }
+
+    nvshmemt_libfabric_comp_entry_t *find(uint32_t seq) {
+        uint32_t i = idx(seq);
+        return occupied[i] ? &entries[i] : nullptr;
+    }
+
+    void erase(uint32_t seq) {
+        occupied[idx(seq)] = false;
+    }
+};
+
 typedef struct {
-    std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
-    std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t> *proxy_put_signal_comp_map;
-    std::unordered_map<int, uint32_t> *next_expected_seq;
+    std::vector<nvshmemt_libfabric_endpoint_seq_counter_t> put_signal_seq_counter_per_pe;
+    std::vector<nvshmemt_libfabric_per_pe_comp_ring> proxy_put_signal_comp_map;
+    std::vector<uint32_t> next_expected_seq;
+    int n_pes;
 } nvshmemt_libfabric_signal_state_t;
 
 struct signal_delivery_work_entry {
