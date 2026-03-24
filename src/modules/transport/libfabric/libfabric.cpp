@@ -739,6 +739,10 @@ int nvshmemt_libfabric_gdr_process_amos_ack(nvshmem_transport_t transport, int q
     for (int i = qp_index; i < end_iter; i++) {
         int ops_processed = 0;
 
+        /* Skip EPs with no pending ack recv work */
+        if (!libfabric_state->op_queue[i]->hasRecvWork(NVSHMEMT_LIBFABRIC_RECV_TYPE_ACK))
+            continue;
+
         size_t num_retries = 0;
         do {
             do {
@@ -787,6 +791,10 @@ int nvshmemt_libfabric_gdr_process_amos(nvshmem_transport_t transport, int qp_in
 
     for (int i = qp_index; i < end_iter; i++) {
         int ops_processed = 0;
+
+        /* Skip EPs with no pending recv work */
+        if (!libfabric_state->op_queue[i]->hasRecvWork(NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK))
+            continue;
 
         do {
             do {
@@ -1028,10 +1036,6 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
     int target_ep;
     void *context = NULL;
 
-    memset(&p_op_l_iov, 0, sizeof(struct iovec));
-    memset(&p_op_msg, 0, sizeof(struct fi_msg_rma));
-    memset(&p_op_r_iov, 0, sizeof(struct fi_rma_iov));
-
     /* put_signal passes in EP to ensure that both operations go through same EP */
     if (!ep) ep = nvshmemt_libfabric_get_next_ep(libfabric_state, qp_index);
 
@@ -1074,6 +1078,9 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
             } while (try_again(tcurr, &status, &num_retries, qp_index,
                                NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_RMA_IMPL_OP_P_EFA));
         } else {
+            memset(&p_op_l_iov, 0, sizeof(struct iovec));
+            memset(&p_op_msg, 0, sizeof(struct fi_msg_rma));
+            memset(&p_op_r_iov, 0, sizeof(struct fi_rma_iov));
             p_op_msg.msg_iov = &p_op_l_iov;
             p_op_msg.desc = NULL;  // Local buffer is on the stack
             p_op_msg.iov_count = 1;
@@ -1944,6 +1951,7 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
             state->mr.push_back(mr);
 
             state->op_queue.push_back(new threadSafeOpQueue);
+            state->op_queue[i]->init(num_sends, num_recvs);
             state->op_queue[i]->putToSendBulk((char *)state->send_buf[i], elem_size, num_sends);
             state->op_queue[i]->set_auto_progress(use_auto_progress);
         }

@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <stdint.h>  // IWYU pragma: keep
 #include <stdio.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
 #include <deque>
@@ -271,6 +272,7 @@ typedef struct {
 
 // Entry types for completion map
 enum nvshmemt_libfabric_comp_entry_type {
+    NVSHMEMT_LIBFABRIC_COMP_ENTRY_EMPTY = 0,  /* Sentinel: slot is unoccupied */
     NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL,
     NVSHMEMT_LIBFABRIC_COMP_ENTRY_PUT_ACK
 };
@@ -371,19 +373,79 @@ class conditional_mutex {
     void unlock() { if (needs_lock) mtx.unlock(); }
 };
 
+/**
+ * Fixed-capacity ring buffer for void* pointers, used as FIFO.
+ * Pre-allocated at init time to avoid dynamic allocation on the fast path.
+ */
+class FixedRing {
+    void **buf;
+    int capacity;
+    int head;  /* next write position */
+    int tail;  /* next read position */
+    int count;
+
+   public:
+    FixedRing() : buf(nullptr), capacity(0), head(0), tail(0), count(0) {}
+    ~FixedRing() { free(buf); }
+    FixedRing(const FixedRing &) = delete;
+    FixedRing &operator=(const FixedRing &) = delete;
+
+    void init(int cap) {
+        capacity = cap;
+        buf = (void **)calloc(cap, sizeof(void *));
+        assert(buf);
+    }
+
+    bool empty() const { return count == 0; }
+    int size() const { return count; }
+
+    void push_back(void *elem) {
+        assert(count < capacity);
+        buf[head] = elem;
+        head = (head + 1 == capacity) ? 0 : head + 1;
+        count++;
+    }
+
+    void *pop_front() {
+        assert(count > 0);
+        void *elem = buf[tail];
+        tail = (tail + 1 == capacity) ? 0 : tail + 1;
+        count--;
+        return elem;
+    }
+
+    void *pop_back() {
+        assert(count > 0);
+        head = (head == 0) ? capacity - 1 : head - 1;
+        count--;
+        return buf[head];
+    }
+
+    void *front() const {
+        assert(count > 0);
+        return buf[tail];
+    }
+};
+
 class threadSafeOpQueue {
    private:
     conditional_mutex send_mutex;
     conditional_mutex ack_recv_mutex;
     conditional_mutex other_recv_mutex;
-    std::vector<void *> send;
-    std::deque<void *> ack_recv;
-    std::deque<void *> other_recv;
+    FixedRing send;
+    FixedRing ack_recv;
+    FixedRing other_recv;
 
    public:
     threadSafeOpQueue() = default;
     threadSafeOpQueue(const threadSafeOpQueue &) = delete;
     threadSafeOpQueue &operator=(const threadSafeOpQueue &) = delete;
+
+    void init(int send_capacity, int recv_capacity) {
+        send.init(send_capacity);
+        ack_recv.init(recv_capacity);
+        other_recv.init(recv_capacity);
+    }
 
     /* Disable locking when FI_THREAD_COMPLETION keeps host/proxy EPs disjoint. */
     void set_auto_progress(bool auto_progress) {
@@ -392,9 +454,17 @@ class threadSafeOpQueue {
         other_recv_mutex.set_needs_lock(!auto_progress);
     }
 
+    /* Lock-free check to skip EPs with no pending recv work. */
+    bool hasRecvWork(nvshmemt_libfabric_recv_type_t recv_type) const {
+        if (recv_type == NVSHMEMT_LIBFABRIC_RECV_TYPE_ACK)
+            return !ack_recv.empty();
+        else
+            return !other_recv.empty();
+    }
+
     int getNextSends(void **elems, size_t num_elems = 1) {
         send_mutex.lock();
-        if (send.size() < num_elems) {
+        if ((size_t)send.size() < num_elems) {
             for (size_t i = 0; i < num_elems; i++) {
                 elems[i] = NULL;
             }
@@ -402,8 +472,7 @@ class threadSafeOpQueue {
             return -EAGAIN;
         }
         for (size_t i = 0; i < num_elems; i++) {
-            elems[i] = send.back();
-            send.pop_back();
+            elems[i] = send.pop_back();
             assert(elems[i] != NULL);
         }
         send_mutex.unlock();
@@ -449,9 +518,8 @@ class threadSafeOpQueue {
                 ack_recv_mutex.unlock();
                 return 0;
             }
-            *recv_elem = (nvshmemt_libfabric_gdr_op_ctx_t *)ack_recv.front();
+            *recv_elem = (nvshmemt_libfabric_gdr_op_ctx_t *)ack_recv.pop_front();
             assert(*recv_elem != NULL);
-            ack_recv.pop_front();
             ack_recv_mutex.unlock();
             return 0;
         } else {
@@ -465,7 +533,6 @@ class threadSafeOpQueue {
         send_mutex.lock();
         send.push_back(elem);
         send_mutex.unlock();
-        return;
     }
 
     void putToSendBulk(char *elem, size_t elem_size, size_t num_elems) {
@@ -475,20 +542,16 @@ class threadSafeOpQueue {
             elem = elem + elem_size;
         }
         send_mutex.unlock();
-        return;
     }
 
     void *getNextRecv(nvshmemt_libfabric_recv_type_t recv_type) {
-        void *elem = NULL;
         if (recv_type == NVSHMEMT_LIBFABRIC_RECV_TYPE_ACK) {
             ack_recv_mutex.lock();
             if (ack_recv.empty()) {
                 ack_recv_mutex.unlock();
                 return NULL;
             }
-
-            elem = ack_recv.front();
-            ack_recv.pop_front();
+            void *elem = ack_recv.pop_front();
             ack_recv_mutex.unlock();
             return elem;
         } else {
@@ -497,8 +560,7 @@ class threadSafeOpQueue {
                 other_recv_mutex.unlock();
                 return NULL;
             }
-            elem = other_recv.front();
-            other_recv.pop_front();
+            void *elem = other_recv.pop_front();
             other_recv_mutex.unlock();
             return elem;
         }
@@ -516,7 +578,6 @@ class threadSafeOpQueue {
         } else {
             fprintf(stderr, "putToRecv: invalid recv_type: %d\n", recv_type);
             assert(false);
-            return;
         }
     }
 };
@@ -532,26 +593,28 @@ struct nvshmemt_libfabric_per_pe_comp_ring {
     static_assert((RING_SIZE & RING_MASK) == 0, "RING_SIZE must be power of 2");
 
     nvshmemt_libfabric_comp_entry_t entries[RING_SIZE];
-    bool occupied[RING_SIZE];
 
-    nvshmemt_libfabric_per_pe_comp_ring() { memset(occupied, 0, sizeof(occupied)); }
+    nvshmemt_libfabric_per_pe_comp_ring() {
+        for (uint32_t i = 0; i < RING_SIZE; i++)
+            entries[i].type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_EMPTY;
+    }
 
     uint32_t idx(uint32_t seq) const { return seq & RING_MASK; }
 
     void insert(uint32_t seq, const nvshmemt_libfabric_comp_entry_t &entry) {
         uint32_t i = idx(seq);
-        assert(!occupied[i] && "Ring buffer collision: too many outstanding ops per PE");
+        assert(entries[i].type == NVSHMEMT_LIBFABRIC_COMP_ENTRY_EMPTY &&
+               "Ring buffer collision: too many outstanding ops per PE");
         entries[i] = entry;
-        occupied[i] = true;
     }
 
     nvshmemt_libfabric_comp_entry_t *find(uint32_t seq) {
         uint32_t i = idx(seq);
-        return occupied[i] ? &entries[i] : nullptr;
+        return (entries[i].type != NVSHMEMT_LIBFABRIC_COMP_ENTRY_EMPTY) ? &entries[i] : nullptr;
     }
 
     void erase(uint32_t seq) {
-        occupied[idx(seq)] = false;
+        entries[idx(seq)].type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_EMPTY;
     }
 };
 
@@ -583,13 +646,15 @@ struct signal_delivery_done_entry {
 
 template <typename T, int CAPACITY = 1024>
 class SPSCRing {
+    static_assert((CAPACITY & (CAPACITY - 1)) == 0, "CAPACITY must be power of 2");
+    static constexpr int MASK = CAPACITY - 1;
     T ring[CAPACITY];
     alignas(64) std::atomic<int> head{0};
     alignas(64) std::atomic<int> tail{0};
    public:
     bool push(const T &entry) {
         int h = head.load(std::memory_order_relaxed);
-        int next = (h + 1) % CAPACITY;
+        int next = (h + 1) & MASK;
         if (next == tail.load(std::memory_order_acquire)) return false;
         ring[h] = entry;
         head.store(next, std::memory_order_release);
@@ -599,7 +664,7 @@ class SPSCRing {
         int t = tail.load(std::memory_order_relaxed);
         if (t == head.load(std::memory_order_acquire)) return false;
         entry = ring[t];
-        tail.store((t + 1) % CAPACITY, std::memory_order_release);
+        tail.store((t + 1) & MASK, std::memory_order_release);
         return true;
     }
 };
