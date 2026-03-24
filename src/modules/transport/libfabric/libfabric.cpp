@@ -652,7 +652,8 @@ out:
     return status;
 }
 
-/* Drain done_queue: Thread A does fi_recv re-post + fi_send response + fi_writedata ACK */
+/* Process one done_queue entry: fi_recv re-post + fi_send response + fi_writedata ACK.
+ * Only processes one entry per call to avoid starving CQ polling and new work submission. */
 static int nvshmemt_libfabric_gdr_complete_amos(nvshmem_transport_t transport) {
     nvshmemt_libfabric_state_t *libfabric_state = (nvshmemt_libfabric_state_t *)transport->state;
     signal_delivery_done_entry done;
@@ -660,43 +661,42 @@ static int nvshmemt_libfabric_gdr_complete_amos(nvshmem_transport_t transport) {
     int send_elems_index = 0;
     int status = 0;
 
-    while (libfabric_state->signal_done_queue.pop(done)) {
-        send_elems_index = 0;
-        num_retries = 0;
-
-        /* Post recv before posting TX operations to avoid deadlocks */
-        status = fi_recv(done.op->ep->endpoint, (void *)done.op, NVSHMEM_STAGED_AMO_WIREDATA_SIZE,
-                         fi_mr_desc(libfabric_state->mr[done.op->ep->domain_index]),
-                         FI_ADDR_UNSPEC, &done.op->ofi_context);
-        NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to re-post recv.\n");
-
-        if (done.is_fetch_amo) {
-            nvshmemt_libfabric_gdr_op_ctx_t *resp_op = done.send_elems[send_elems_index];
-
-            resp_op->ret_amo.elem.data = done.old_value;
-            resp_op->ret_amo.elem.flag = done.ret_flags;
-            resp_op->ret_amo.ret_addr = done.ret_addr;
-            resp_op->type = NVSHMEMT_LIBFABRIC_ACK;
-
-            do {
-                status = fi_send(done.ep->endpoint, (void *)resp_op,
-                                 NVSHMEM_STAGED_AMO_WIREDATA_SIZE,
-                                 fi_mr_desc(libfabric_state->mr[done.ep->domain_index]),
-                                 done.src_addr, &resp_op->ofi_context);
-            } while (try_again(transport, &status, &num_retries, done.ep->domain_index,
-                               NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_PERFORM_GDRCOPY_AMO_SEND,
-                               true));
-            NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-                                  "Unable to respond to atomic request.\n");
-            done.ep->submitted_ops++;
-            send_elems_index++;
-        }
-
-        status = gdrcopy_amo_ack(transport, done.ep, done.src_addr, done.sequence_count,
-                                 done.src_pe, &done.send_elems[send_elems_index],
-                                 NVSHMEMT_LIBFABRIC_IMM_STAGED_ATOMIC_ACK);
-        NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to send ack.\n");
+    if (!libfabric_state->signal_done_queue.pop(done)) {
+        return 0;
     }
+
+    /* Post recv before posting TX operations to avoid deadlocks */
+    status = fi_recv(done.op->ep->endpoint, (void *)done.op, NVSHMEM_STAGED_AMO_WIREDATA_SIZE,
+                     fi_mr_desc(libfabric_state->mr[done.op->ep->domain_index]),
+                     FI_ADDR_UNSPEC, &done.op->ofi_context);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to re-post recv.\n");
+
+    if (done.is_fetch_amo) {
+        nvshmemt_libfabric_gdr_op_ctx_t *resp_op = done.send_elems[send_elems_index];
+
+        resp_op->ret_amo.elem.data = done.old_value;
+        resp_op->ret_amo.elem.flag = done.ret_flags;
+        resp_op->ret_amo.ret_addr = done.ret_addr;
+        resp_op->type = NVSHMEMT_LIBFABRIC_ACK;
+
+        do {
+            status = fi_send(done.ep->endpoint, (void *)resp_op,
+                             NVSHMEM_STAGED_AMO_WIREDATA_SIZE,
+                             fi_mr_desc(libfabric_state->mr[done.ep->domain_index]),
+                             done.src_addr, &resp_op->ofi_context);
+        } while (try_again(transport, &status, &num_retries, done.ep->domain_index,
+                           NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_PERFORM_GDRCOPY_AMO_SEND,
+                           true));
+        NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+                              "Unable to respond to atomic request.\n");
+        done.ep->submitted_ops++;
+        send_elems_index++;
+    }
+
+    status = gdrcopy_amo_ack(transport, done.ep, done.src_addr, done.sequence_count,
+                             done.src_pe, &done.send_elems[send_elems_index],
+                             NVSHMEMT_LIBFABRIC_IMM_STAGED_ATOMIC_ACK);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to send ack.\n");
 
 out:
     return status;
