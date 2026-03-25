@@ -970,7 +970,7 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
     domain_idx = ep.domain_index;
     target_ep = pe * libfabric_state->eps.size() + ep_idx;
 
-    if (libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA) {
+    if (likely(libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA)) {
         nvshmemt_libfabric_gdr_op_ctx_t *gdr_ctx;
         do {
             status = libfabric_state->op_queue[domain_idx]->getNextSends((void **)(&gdr_ctx), 1);
@@ -1034,12 +1034,12 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
         }
     } else if (verb.desc == NVSHMEMI_OP_PUT) {
         uintptr_t remote_addr;
-        if (libfabric_state->prov_infos[domain_idx]->domain_attr->mr_mode & FI_MR_VIRT_ADDR)
+        if (likely(libfabric_state->prov_infos[domain_idx]->domain_attr->mr_mode & FI_MR_VIRT_ADDR))
             remote_addr = (uintptr_t)remote->ptr;
         else
             remote_addr = (uintptr_t)remote->offset;
         do {
-            if (imm_data) {
+            if (likely(imm_data != NULL)) {
                 status = fi_writedata(ep.endpoint, local->ptr, op_size, local_mr_desc, *imm_data,
                                       target_ep, remote_addr, remote_handle->key, context);
             } else
@@ -1066,11 +1066,11 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
                            "Invalid RMA operation specified.\n");
     }
 
-    if (status) goto out;  // Status set by try_again
+    if (unlikely(status)) goto out;  // Status set by try_again
     ep.submitted_ops++;
 
 out:
-    if (status) {
+    if (unlikely(status)) {
         NVSHMEMI_ERROR_PRINT("Received an error when trying to post an RMA operation.\n");
     }
 
