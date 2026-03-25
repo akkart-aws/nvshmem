@@ -463,8 +463,8 @@ static inline int try_again(nvshmem_transport_t transport, int *status, uint64_t
         return 0;
     }
 
-    if (*status == -FI_EAGAIN) {
-        if (*num_retries >= NVSHMEMT_LIBFABRIC_MAX_RETRIES) {
+    if (unlikely(*status == -FI_EAGAIN)) {
+        if (unlikely(*num_retries >= NVSHMEMT_LIBFABRIC_MAX_RETRIES)) {
             fprintf(stderr, "call site: %d, Max amount of libfabric retries reached, %d: %s\n",
                     call_site, *status, fi_strerror(*status * -1));
             *status = NVSHMEMX_ERROR_INTERNAL;
@@ -478,7 +478,7 @@ static inline int try_again(nvshmem_transport_t transport, int *status, uint64_t
         }
     }
 
-    if (*status != 0) {
+    if (unlikely(*status != 0)) {
         fprintf(stderr, "Error in libfabric operation (%d): %s.\n", *status,
                 fi_strerror(*status * -1));
         *status = NVSHMEMX_ERROR_INTERNAL;
@@ -1037,16 +1037,13 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
     int target_ep;
     void *context = NULL;
 
-    memset(&p_op_l_iov, 0, sizeof(struct iovec));
-    memset(&p_op_msg, 0, sizeof(struct fi_msg_rma));
-    memset(&p_op_r_iov, 0, sizeof(struct fi_rma_iov));
 
     /* put_signal passes in EP to ensure that both operations go through same EP */
-    if (!ep) ep = nvshmemt_libfabric_get_next_ep(libfabric_state, qp_index);
+    if (unlikely(!ep)) ep = nvshmemt_libfabric_get_next_ep(libfabric_state, qp_index);
 
     target_ep = pe * libfabric_state->num_selected_domains + ep->domain_index;
 
-    if (libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA) {
+    if (likely(libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA)) {
         nvshmemt_libfabric_gdr_op_ctx_t *gdr_ctx;
         do {
             status = libfabric_state->op_queue[ep->domain_index]->getNextSends((void **)(&gdr_ctx), 1);
@@ -1069,7 +1066,27 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
 
     NVSHMEM_TRACE_SENDER_POST_RMA(pe, ep->domain_index, op_size, verb.desc, (uint64_t)remote->ptr);
 
-    if (verb.desc == NVSHMEMI_OP_P) {
+    /* HOT PATH: OP_PUT is the common case, check it first with likely */
+    if (likely(verb.desc == NVSHMEMI_OP_PUT)) {
+        uintptr_t remote_addr;
+        if (likely(libfabric_state->prov_infos[ep->domain_index]->domain_attr->mr_mode & FI_MR_VIRT_ADDR))
+            remote_addr = (uintptr_t)remote->ptr;
+        else
+            remote_addr = (uintptr_t)remote->offset;
+
+        do {
+            if (likely(imm_data != NULL)) {
+                status =
+                    fi_writedata(ep->endpoint, local->ptr, op_size, local_mr_desc,
+                                 *imm_data, target_ep, remote_addr, remote_handle->key, context);
+            }
+            else
+                status = fi_write(ep->endpoint, local->ptr, op_size, local_mr_desc,
+                                  target_ep, remote_addr, remote_handle->key, context);
+        } while (try_again(tcurr, &status, &num_retries, qp_index,
+                           NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_RMA_IMPL_OP_PUT));
+
+    } else if (unlikely(verb.desc == NVSHMEMI_OP_P)) {
         if (libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA) {
             nvshmemt_libfabric_gdr_op_ctx_t *p_buf =
                 container_of(context, nvshmemt_libfabric_gdr_op_ctx_t, ofi_context);
@@ -1083,6 +1100,7 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
             } while (try_again(tcurr, &status, &num_retries, qp_index,
                                NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_RMA_IMPL_OP_P_EFA));
         } else {
+            memset(&p_op_msg, 0, sizeof(struct fi_msg_rma));
             p_op_msg.msg_iov = &p_op_l_iov;
             p_op_msg.desc = NULL;  // Local buffer is on the stack
             p_op_msg.iov_count = 1;
@@ -1090,9 +1108,11 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
             p_op_msg.rma_iov = &p_op_r_iov;
             p_op_msg.rma_iov_count = 1;
 
+            memset(&p_op_l_iov, 0, sizeof(struct iovec));
             p_op_l_iov.iov_base = local->ptr;
             p_op_l_iov.iov_len = op_size;
 
+            memset(&p_op_r_iov, 0, sizeof(struct fi_rma_iov));
             if (libfabric_state->prov_infos[ep->domain_index]->domain_attr->mr_mode &
                 FI_MR_VIRT_ADDR)
                 p_op_r_iov.addr = (uintptr_t)remote->ptr;
@@ -1109,24 +1129,7 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
             } while (try_again(tcurr, &status, &num_retries, qp_index,
                                NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_RMA_IMPL_OP_P_NON_EFA));
         }
-    } else if (verb.desc == NVSHMEMI_OP_PUT) {
-        uintptr_t remote_addr;
-        if (libfabric_state->prov_infos[ep->domain_index]->domain_attr->mr_mode & FI_MR_VIRT_ADDR)
-            remote_addr = (uintptr_t)remote->ptr;
-        else
-            remote_addr = (uintptr_t)remote->offset;
-        do {
-            if (imm_data) {
-                status =
-                    fi_writedata(ep->endpoint, local->ptr, op_size, local_mr_desc,
-                                 *imm_data, target_ep, remote_addr, remote_handle->key, context);
-            }
-            else
-                status = fi_write(ep->endpoint, local->ptr, op_size, local_mr_desc,
-                                  target_ep, remote_addr, remote_handle->key, context);
-        } while (try_again(tcurr, &status, &num_retries, qp_index,
-                           NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_RMA_IMPL_OP_PUT));
-    } else if (verb.desc == NVSHMEMI_OP_G || verb.desc == NVSHMEMI_OP_GET) {
+    } else if (unlikely(verb.desc == NVSHMEMI_OP_G || verb.desc == NVSHMEMI_OP_GET)) {
         assert(
             !imm_data);  // Write w/ imm not suppored with NVSHMEMI_OP_G/GET on Libfabric transport
         uintptr_t remote_addr;
@@ -1145,11 +1148,11 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
                            "Invalid RMA operation specified.\n");
     }
 
-    if (status) goto out;  // Status set by try_again
+out:
     ep->submitted_ops++;
 
-out:
-    if (status) {
+    if (unlikely(status)) {
+        ep->submitted_ops--;
         NVSHMEMI_ERROR_PRINT("Received an error when trying to post an RMA operation.\n");
     }
 
