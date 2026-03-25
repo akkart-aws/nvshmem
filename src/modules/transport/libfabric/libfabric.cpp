@@ -1069,11 +1069,11 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
                            "Invalid RMA operation specified.\n");
     }
 
-    if (unlikely(status)) goto out;  // Status set by try_again
+out:
     ep.submitted_ops++;
 
-out:
     if (unlikely(status)) {
+        ep.submitted_ops--;
         NVSHMEMI_ERROR_PRINT("Received an error when trying to post an RMA operation.\n");
     }
 
