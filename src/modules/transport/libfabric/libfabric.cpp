@@ -962,9 +962,6 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
     int target_ep, ep_idx, domain_idx;
     void *context = NULL;
 
-    memset(&p_op_l_iov, 0, sizeof(struct iovec));
-    memset(&p_op_msg, 0, sizeof(struct fi_msg_rma));
-    memset(&p_op_r_iov, 0, sizeof(struct fi_rma_iov));
 
     ep_idx = ep.ep_index;
     domain_idx = ep.domain_index;
@@ -1007,6 +1004,7 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
             } while (try_again(tcurr, &status, &num_retries, qp_index,
                                NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_RMA_IMPL_OP_P_EFA));
         } else {
+            memset(&p_op_msg, 0, sizeof(struct fi_msg_rma));
             p_op_msg.msg_iov = &p_op_l_iov;
             p_op_msg.desc = NULL;  // Local buffer is on the stack
             p_op_msg.iov_count = 1;
@@ -1014,9 +1012,11 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
             p_op_msg.rma_iov = &p_op_r_iov;
             p_op_msg.rma_iov_count = 1;
 
+            memset(&p_op_l_iov, 0, sizeof(struct iovec));
             p_op_l_iov.iov_base = local->ptr;
             p_op_l_iov.iov_len = op_size;
 
+            memset(&p_op_r_iov, 0, sizeof(struct fi_rma_iov));
             if (libfabric_state->prov_infos[domain_idx]->domain_attr->mr_mode & FI_MR_VIRT_ADDR)
                 p_op_r_iov.addr = (uintptr_t)remote->ptr;
             else
