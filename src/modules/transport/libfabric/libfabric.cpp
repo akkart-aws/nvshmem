@@ -868,9 +868,8 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
     nvshmemt_libfabric_gdr_op_ctx_t *op = NULL;
     bool is_write_comp = entry->flags & FI_REMOTE_CQ_DATA;
     int status = 0, progress_count, pe;
-    uint64_t map_key;
+    uint32_t seq_key;
     bool is_standalone_put = false;
-    std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t>::iterator iter;
 
     /* Use host_signal_state for eps[0], proxy_signal_state for eps[1+] */
     nvshmemt_libfabric_signal_state_t *signal_state =
@@ -890,12 +889,12 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
             get_write_with_imm_hdr(entry->data);
         is_standalone_put = (imm_header == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT ||
                              imm_header == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ);
-        map_key = (((uint64_t)pe) << 32) | ((uint32_t)entry->data & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK);
+        seq_key = (uint32_t)entry->data & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK;
         progress_count = -1;
     } else {
         sig_op = (nvshmemt_libfabric_gdr_signal_op *)container_of(
             entry->op_context, nvshmemt_libfabric_gdr_op_ctx_t, ofi_context);
-        map_key = (((uint64_t)pe) << 32) | sig_op->sequence_count;
+        seq_key = sig_op->sequence_count;
         progress_count = (int)sig_op->num_writes;
 
         /* The EFA provider has an inline send size of 32 bytes.
@@ -908,40 +907,40 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
         op = inplace_copy_sig_op_to_gdr_op(sig_op, ep.ep_index);
     }
 
-    if (is_write_comp && get_write_with_imm_hdr(entry->data) == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ) {
-        nvshmemt_libfabric_comp_entry_t ack_comp_entry;
-        ack_comp_entry.type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_PUT_ACK;
-        ack_comp_entry.ack_entry.src_addr = *addr;
-        ack_comp_entry.ack_entry.ep = &ep;
-        signal_state->proxy_put_signal_comp_map->insert(std::make_pair(map_key, ack_comp_entry));
-    } else {
-        iter = signal_state->proxy_put_signal_comp_map->find(map_key);
-        if (iter != signal_state->proxy_put_signal_comp_map->end()) {
-            if (!is_write_comp) iter->second.signal_entry.op = op;
-            iter->second.signal_entry.progress_count += progress_count;
-        } else {
-            nvshmemt_libfabric_comp_entry_t sig_comp_entry;
-            sig_comp_entry.type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL;
-            if (is_standalone_put) {
-                sig_comp_entry.signal_entry.op = nullptr;
-                sig_comp_entry.signal_entry.progress_count = 0;
-            } else {
-                sig_comp_entry.signal_entry.op = op;
-                sig_comp_entry.signal_entry.progress_count = progress_count;
-            }
-            signal_state->proxy_put_signal_comp_map->insert(std::make_pair(map_key, sig_comp_entry));
-            iter = signal_state->proxy_put_signal_comp_map->find(map_key);
-        }
+    {
+        auto &slot = (*signal_state->proxy_put_signal_comp_map)[pe][seq_key % NVSHMEMT_LIBFABRIC_COMP_MAP_SLOTS];
 
-        if (iter->second.signal_entry.progress_count != 0) {
-            goto out;
+        if (is_write_comp && get_write_with_imm_hdr(entry->data) == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ) {
+            slot.type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_PUT_ACK;
+            slot.ack_entry.src_addr = *addr;
+            slot.ack_entry.ep = &ep;
+        } else {
+            if (slot.type != NVSHMEMT_LIBFABRIC_COMP_ENTRY_EMPTY) {
+                /* Existing entry — update it */
+                if (!is_write_comp) slot.signal_entry.op = op;
+                slot.signal_entry.progress_count += progress_count;
+            } else {
+                /* New entry */
+                slot.type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL;
+                if (is_standalone_put) {
+                    slot.signal_entry.op = nullptr;
+                    slot.signal_entry.progress_count = 0;
+                } else {
+                    slot.signal_entry.op = op;
+                    slot.signal_entry.progress_count = progress_count;
+                }
+            }
+
+            if (slot.signal_entry.progress_count != 0) {
+                goto out;
+            }
         }
     }
 
     {
         fi_addr_t src_addr = *addr;
-        // operator[] will default-construct (initialize to 0) if src_addr doesn't exist
         uint32_t &next_seq = (*signal_state->next_expected_seq)[pe];
+        constexpr int SLOTS = NVSHMEMT_LIBFABRIC_COMP_MAP_SLOTS;
 
         while (true) {
             // Skip reserved sequence number
@@ -950,21 +949,20 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
                 continue;
             }
 
-            uint64_t key = (((uint64_t)pe) << 32) | next_seq;
-            auto it = signal_state->proxy_put_signal_comp_map->find(key);
+            auto &slot = (*signal_state->proxy_put_signal_comp_map)[pe][next_seq % SLOTS];
 
-            if (it == signal_state->proxy_put_signal_comp_map->end()) break;
+            if (slot.type == NVSHMEMT_LIBFABRIC_COMP_ENTRY_EMPTY) break;
 
-            if (it->second.type == NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL) {
-                if (it->second.signal_entry.progress_count != 0) break;
+            if (slot.type == NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL) {
+                if (slot.signal_entry.progress_count != 0) break;
 
-                if (it->second.signal_entry.op != NULL) {
-                    int op_ep_idx = it->second.signal_entry.op->ep_index;
+                if (slot.signal_entry.op != NULL) {
+                    int op_ep_idx = slot.signal_entry.op->ep_index;
                     libfabric_state->op_queue[libfabric_state->eps[op_ep_idx]->domain_index]->putToRecv(
-                        it->second.signal_entry.op, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
+                        slot.signal_entry.op, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
                 }
             } else {
-                nvshmemt_libfabric_endpoint_t *ack_ep = it->second.ack_entry.ep;
+                nvshmemt_libfabric_endpoint_t *ack_ep = slot.ack_entry.ep;
                 nvshmemt_libfabric_gdr_op_ctx_t *send_elem;
                 uint64_t num_retries = 0;
                 do {
@@ -974,13 +972,13 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
                                   NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_GDRCOPY_AMO_ACK, true));
 
                 if (status == 0) {
-                    status = gdrcopy_amo_ack(transport, *ack_ep, it->second.ack_entry.src_addr, next_seq, pe,
+                    status = gdrcopy_amo_ack(transport, *ack_ep, slot.ack_entry.src_addr, next_seq, pe,
                                                  &send_elem, NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK);
                 }
                 NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "gdrcopy_amo_ack failed\n");
             }
 
-            signal_state->proxy_put_signal_comp_map->erase(it);
+            slot.type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_EMPTY;
             next_seq = (next_seq + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
         }
     }
@@ -2035,18 +2033,22 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
 
     /* Initialize state-level signal ordering state */
     state->host_signal_state.put_signal_seq_counter_per_pe =
-        new std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t>();
+        new std::vector<nvshmemt_libfabric_endpoint_seq_counter_t>(n_pes);
     state->host_signal_state.proxy_put_signal_comp_map =
-        new std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t>();
+        new std::vector<std::vector<nvshmemt_libfabric_comp_entry_t>>(
+            n_pes, std::vector<nvshmemt_libfabric_comp_entry_t>(
+                NVSHMEMT_LIBFABRIC_COMP_MAP_SLOTS));
     state->host_signal_state.next_expected_seq =
-        new std::unordered_map<int, uint32_t>();
+        new std::vector<uint32_t>(n_pes, 0);
 
     state->proxy_signal_state.put_signal_seq_counter_per_pe =
-        new std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t>();
+        new std::vector<nvshmemt_libfabric_endpoint_seq_counter_t>(n_pes);
     state->proxy_signal_state.proxy_put_signal_comp_map =
-        new std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t>();
+        new std::vector<std::vector<nvshmemt_libfabric_comp_entry_t>>(
+            n_pes, std::vector<nvshmemt_libfabric_comp_entry_t>(
+                NVSHMEMT_LIBFABRIC_COMP_MAP_SLOTS));
     state->proxy_signal_state.next_expected_seq =
-        new std::unordered_map<int, uint32_t>();
+        new std::vector<uint32_t>(n_pes, 0);
 
     for (size_t i = 0; i < state->prov_infos.size(); i++) {
         INFO(state->log_level, "Selected provider %s, fabric %s, nic %s, hmem %s domain %zu/%zu",

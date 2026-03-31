@@ -281,6 +281,7 @@ typedef struct {
 
 // Entry types for completion map
 enum nvshmemt_libfabric_comp_entry_type {
+    NVSHMEMT_LIBFABRIC_COMP_ENTRY_EMPTY = 0,
     NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL,
     NVSHMEMT_LIBFABRIC_COMP_ENTRY_PUT_ACK
 };
@@ -528,10 +529,12 @@ class threadSafeOpQueue {
  * in the future. That is, it may be the case that eps.size() != devices.size(). The domain index
  * of an endpoint is stored directly in nvshmemt_libfabric_endpoint_t (domain_index).
  */
+static constexpr int NVSHMEMT_LIBFABRIC_COMP_MAP_SLOTS = 2048;
+
 typedef struct {
-    std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
-    std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t> *proxy_put_signal_comp_map;
-    std::unordered_map<int, uint32_t> *next_expected_seq;
+    std::vector<nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
+    std::vector<std::vector<nvshmemt_libfabric_comp_entry_t>> *proxy_put_signal_comp_map;
+    std::vector<uint32_t> *next_expected_seq;
 } nvshmemt_libfabric_signal_state_t;
 
 struct signal_delivery_work_entry {
