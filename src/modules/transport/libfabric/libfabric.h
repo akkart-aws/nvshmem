@@ -67,7 +67,7 @@ typedef struct {
 struct nvshmemt_libfabric_gdr_op_ctx;
 typedef struct nvshmemt_libfabric_gdr_op_ctx nvshmemt_libfabric_gdr_op_ctx_t;
 
-#define NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT 28
+#define NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT 16
 #define NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK \
     ((1U << NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT) - 1)
 
@@ -185,62 +185,25 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
     }
 
     /**
-     * Mark a previously issued seq_num as complete, decremeting the pending
-     * acks counter for the category
+     * Decrement pending_acks by count, ending at end_seq.
+     * Distributes the count across categories based on end_seq position.
      */
-    void return_acked_seq_num(uint32_t seq_num) {
-        assert(seq_num != NVSHMEM_STAGED_AMO_SEQ_NUM);
-
-        uint32_t category = get_category(seq_num);
-
-        assert(pending_acks[category] > 0);
-        --pending_acks[category];
-    }
-
-    /**
-     * Mark a range of sequence numbers as complete, resulting from reciving a
-     * put ack. The sequence range ends with end_seq.
-     *
-     * We send an ack for every NVSHMEM_STAGED_AMO_PUT_ACK_FREQ puts. Therefore,
-     * a put ack for <end_seq> is an acknowledgement sequence numbers (end_seq -
-     * NVSHMEM_STAGED_AMO_PUT_ACK_FREQ + 1) to end_seq, inclusive. The
-     * wraparound case is also handled.
-     *
-     * This code assumes the sequence range spans at most two categories. This
-     * will be true as long as the index space is sufficiently larger than the
-     * put ack frequency, as static asserted above.
-     */
-    void return_acked_seq_num_range_for_put(uint32_t end_seq) {
+    void return_acked_range(uint32_t end_seq, uint32_t count) {
+        if (count == 0) return;
         assert(end_seq != NVSHMEM_STAGED_AMO_SEQ_NUM);
 
-        uint32_t start_seq = (end_seq - NVSHMEM_STAGED_AMO_PUT_ACK_FREQ + 1) & sequence_mask;
-
-        /* Note: in the wraparound case, the (start_seq, end_seq) range will
-           include NVSHMEM_STAGED_AMO_SEQ_NUM, which is not used. The logic
-           below handles this correctly, as long as `start_category` is correct
-           (which is true as long as the index space is sufficiently large that
-           we can only span two categories, as static-asserted above.) */
-
-        uint32_t start_category = get_category(start_seq);
         uint32_t end_category = get_category(end_seq);
+        uint32_t end_index = get_index(end_seq);
 
-        uint32_t num_indexes;
-        if (end_seq >= start_seq) {
-            num_indexes = end_seq - start_seq + 1;
+        if (end_index >= count - 1) {
+            assert(pending_acks[end_category] >= count);
+            pending_acks[end_category] -= count;
         } else {
-            num_indexes = (NVSHMEM_STAGED_AMO_SEQ_NUM - start_seq + 1) + (end_seq + 1);
-        }
-
-        if (start_category == end_category) {
-            assert(pending_acks[start_category] >= num_indexes);
-            pending_acks[start_category] -= num_indexes;
-        } else {
-            uint32_t count_in_start_cat = (index_mask + 1) - get_index(start_seq);
-            uint32_t count_in_end_cat = get_index(end_seq) + 1;
-
+            uint32_t count_in_end_cat = end_index + 1;
+            uint32_t count_in_start_cat = count - count_in_end_cat;
+            uint32_t start_category = 1 - end_category;
             assert(pending_acks[start_category] >= count_in_start_cat);
             assert(pending_acks[end_category] >= count_in_end_cat);
-
             pending_acks[start_category] -= count_in_start_cat;
             pending_acks[end_category] -= count_in_end_cat;
         }
@@ -289,6 +252,7 @@ struct nvshmemt_libfabric_signal_comp_entry {
 struct nvshmemt_libfabric_put_ack_entry {
     fi_addr_t src_addr;
     nvshmemt_libfabric_endpoint_t *ep;
+    uint8_t put_count;
 };
 
 // Tagged union for completion entries
@@ -532,6 +496,7 @@ struct signal_delivery_work_entry {
     nvshmemt_libfabric_gdr_op_ctx_t *op;
     nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2];
     uint32_t sequence_count;
+    uint8_t preceding_put_count;
 };
 
 struct signal_delivery_done_entry {
@@ -545,6 +510,7 @@ struct signal_delivery_done_entry {
     uint64_t old_value;
     uint64_t ret_flags;
     void *ret_addr;
+    uint8_t preceding_put_count;
 };
 
 template <typename T, int CAPACITY = 1024>
@@ -670,8 +636,11 @@ typedef struct nvshmemt_libfabric_gdr_signal_op {
     uint16_t num_writes;
     uint64_t sig_val;
     void *target_addr;
-    uint32_t sequence_count;
-    uint32_t src_pe;
+    uint16_t sequence_count;
+    uint16_t src_pe;
+    uint16_t ack_seq_num;
+    uint8_t  ack_count;
+    uint8_t  preceding_put_count;
 } nvshmemt_libfabric_gdr_signal_op_t;
 /*  EFA's inline send size is 32 bytes */
 static_assert(sizeof(nvshmemt_libfabric_gdr_signal_op_t) == 32);
