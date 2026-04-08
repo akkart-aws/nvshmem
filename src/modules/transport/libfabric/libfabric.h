@@ -67,7 +67,7 @@ typedef struct {
 struct nvshmemt_libfabric_gdr_op_ctx;
 typedef struct nvshmemt_libfabric_gdr_op_ctx nvshmemt_libfabric_gdr_op_ctx_t;
 
-#define NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT 16
+#define NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT 12
 #define NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK \
     ((1U << NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT) - 1)
 
@@ -258,10 +258,13 @@ struct nvshmemt_libfabric_put_ack_entry {
 // Tagged union for completion entries
 struct nvshmemt_libfabric_comp_entry_t {
     nvshmemt_libfabric_comp_entry_type type;
+    bool valid;
     union {
         nvshmemt_libfabric_signal_comp_entry signal_entry;
         nvshmemt_libfabric_put_ack_entry ack_entry;
     };
+
+    nvshmemt_libfabric_comp_entry_t() : type(NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL), valid(false) {}
 };
 
 typedef struct nvshmemt_libfabric_gdr_send_p_op {
@@ -487,9 +490,11 @@ class threadSafeOpQueue {
  * of an endpoint is stored directly in nvshmemt_libfabric_endpoint_t (domain_index).
  */
 typedef struct {
-    std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
-    std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t> *proxy_put_signal_comp_map;
-    std::unordered_map<int, uint32_t> *next_expected_seq;
+    std::vector<nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
+    std::vector<std::vector<nvshmemt_libfabric_comp_entry_t>> *proxy_put_signal_comp_map; /* [pe][seq] */
+    std::vector<uint32_t> *next_expected_seq;
+    int num_pes{0};
+    int seq_space{0};
 } nvshmemt_libfabric_signal_state_t;
 
 struct signal_delivery_work_entry {

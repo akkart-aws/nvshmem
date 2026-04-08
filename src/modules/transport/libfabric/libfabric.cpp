@@ -264,7 +264,7 @@ int gdrcopy_amo_ack(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t
     resp_op->type = (ack_header == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK)
                         ? NVSHMEMT_LIBFABRIC_SIGNAL_ACK_WRITE
                         : NVSHMEMT_LIBFABRIC_AMO_ACK_WRITE;
-    imm_data = ((uint32_t)ack_header << 28) | ((uint32_t)preceding_put_count << 16) | (sequence_count & 0xFFFF);
+    imm_data = ((uint32_t)ack_header << 28) | ((uint32_t)preceding_put_count << NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT) | (sequence_count & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK);
     do {
         status = fi_writedata(
             ep.endpoint, resp_op, 0, fi_mr_desc(libfabric_state->mrs[ep.domain_index]), imm_data,
@@ -474,7 +474,7 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
                                                          struct fi_cq_data_entry *entry,
                                                          fi_addr_t addr) {
     uint32_t seq_num = entry->data & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK;
-    uint8_t preceding_put_count = ((uint32_t)entry->data >> 16) & 0xFF;
+    uint8_t preceding_put_count = ((uint32_t)entry->data >> NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT) & 0xFF;
 
     if (seq_num != NVSHMEM_STAGED_AMO_SEQ_NUM) {
         /* Use host_signal_state for eps[0], proxy_signal_state for eps[1+] */
@@ -883,9 +883,9 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
     nvshmemt_libfabric_gdr_op_ctx_t *op = NULL;
     bool is_write_comp = entry->flags & FI_REMOTE_CQ_DATA;
     int status = 0, progress_count, pe;
-    uint64_t map_key;
+    uint32_t seq_idx;
     bool is_standalone_put = false;
-    std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t>::iterator iter;
+    nvshmemt_libfabric_comp_entry_t *entry_ptr;
 
     /* Use host_signal_state for eps[0], proxy_signal_state for eps[1+] */
     nvshmemt_libfabric_signal_state_t *signal_state =
@@ -905,58 +905,48 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
             get_write_with_imm_hdr(entry->data);
         is_standalone_put = (imm_header == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT ||
                              imm_header == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ);
-        map_key = (((uint64_t)pe) << 32) | ((uint32_t)entry->data & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK);
+        seq_idx = (uint32_t)entry->data & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK;
         progress_count = -1;
     } else {
         sig_op = (nvshmemt_libfabric_gdr_signal_op *)container_of(
             entry->op_context, nvshmemt_libfabric_gdr_op_ctx_t, ofi_context);
-        map_key = (((uint64_t)pe) << 32) | sig_op->sequence_count;
+        seq_idx = sig_op->sequence_count;
         progress_count = (int)sig_op->num_writes;
 
-        /* The EFA provider has an inline send size of 32 bytes.
-         * The gdr atomic fi_send message is 72 bytes and does not
-         * fit inside the efa_provider's 32 byte inline send window.
-         * Hence, we send a 32 byte nvshmemt_libfabric_gdr_signal_op over the wire,
-         * and re-arrange the memory in-place to allow for re-use of the gdr atomic
-         * code.
-         */
         op = inplace_copy_sig_op_to_gdr_op(sig_op, ep.ep_index);
     }
 
+    entry_ptr = &(*signal_state->proxy_put_signal_comp_map)[pe][seq_idx];
+
     if (is_write_comp && get_write_with_imm_hdr(entry->data) == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ) {
-        nvshmemt_libfabric_comp_entry_t ack_comp_entry;
-        ack_comp_entry.type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_PUT_ACK;
-        ack_comp_entry.ack_entry.src_addr = *addr;
-        ack_comp_entry.ack_entry.ep = &ep;
-        ack_comp_entry.ack_entry.put_count = ((uint32_t)entry->data >> 16) & 0xFF;
-        signal_state->proxy_put_signal_comp_map->insert(std::make_pair(map_key, ack_comp_entry));
+        entry_ptr->type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_PUT_ACK;
+        entry_ptr->valid = true;
+        entry_ptr->ack_entry.src_addr = *addr;
+        entry_ptr->ack_entry.ep = &ep;
+        entry_ptr->ack_entry.put_count = ((uint32_t)entry->data >> NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT) & 0xFF;
     } else {
-        iter = signal_state->proxy_put_signal_comp_map->find(map_key);
-        if (iter != signal_state->proxy_put_signal_comp_map->end()) {
-            if (!is_write_comp) iter->second.signal_entry.op = op;
-            iter->second.signal_entry.progress_count += progress_count;
+        if (entry_ptr->valid) {
+            if (!is_write_comp) entry_ptr->signal_entry.op = op;
+            entry_ptr->signal_entry.progress_count += progress_count;
         } else {
-            nvshmemt_libfabric_comp_entry_t sig_comp_entry;
-            sig_comp_entry.type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL;
+            entry_ptr->type = NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL;
+            entry_ptr->valid = true;
             if (is_standalone_put) {
-                sig_comp_entry.signal_entry.op = nullptr;
-                sig_comp_entry.signal_entry.progress_count = 0;
+                entry_ptr->signal_entry.op = nullptr;
+                entry_ptr->signal_entry.progress_count = 0;
             } else {
-                sig_comp_entry.signal_entry.op = op;
-                sig_comp_entry.signal_entry.progress_count = progress_count;
+                entry_ptr->signal_entry.op = op;
+                entry_ptr->signal_entry.progress_count = progress_count;
             }
-            signal_state->proxy_put_signal_comp_map->insert(std::make_pair(map_key, sig_comp_entry));
-            iter = signal_state->proxy_put_signal_comp_map->find(map_key);
         }
 
-        if (iter->second.signal_entry.progress_count != 0) {
+        if (entry_ptr->signal_entry.progress_count != 0) {
             goto out;
         }
     }
 
     {
         fi_addr_t src_addr = *addr;
-        // operator[] will default-construct (initialize to 0) if src_addr doesn't exist
         uint32_t &next_seq = (*signal_state->next_expected_seq)[pe];
 
         while (true) {
@@ -966,21 +956,20 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
                 continue;
             }
 
-            uint64_t key = (((uint64_t)pe) << 32) | next_seq;
-            auto it = signal_state->proxy_put_signal_comp_map->find(key);
+            nvshmemt_libfabric_comp_entry_t *it = &(*signal_state->proxy_put_signal_comp_map)[pe][next_seq];
 
-            if (it == signal_state->proxy_put_signal_comp_map->end()) break;
+            if (!it->valid) break;
 
-            if (it->second.type == NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL) {
-                if (it->second.signal_entry.progress_count != 0) break;
+            if (it->type == NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL) {
+                if (it->signal_entry.progress_count != 0) break;
 
-                if (it->second.signal_entry.op != NULL) {
-                    int op_ep_idx = it->second.signal_entry.op->ep_index;
+                if (it->signal_entry.op != NULL) {
+                    int op_ep_idx = it->signal_entry.op->ep_index;
                     libfabric_state->op_queue[libfabric_state->eps[op_ep_idx]->domain_index]->putToRecv(
-                        it->second.signal_entry.op, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
+                        it->signal_entry.op, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
                 }
             } else {
-                nvshmemt_libfabric_endpoint_t *ack_ep = it->second.ack_entry.ep;
+                nvshmemt_libfabric_endpoint_t *ack_ep = it->ack_entry.ep;
                 nvshmemt_libfabric_gdr_op_ctx_t *send_elem;
                 uint64_t num_retries = 0;
                 do {
@@ -990,14 +979,14 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
                                   NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_GDRCOPY_AMO_ACK, true));
 
                 if (status == 0) {
-                    status = gdrcopy_amo_ack(transport, *ack_ep, it->second.ack_entry.src_addr, next_seq, pe,
+                    status = gdrcopy_amo_ack(transport, *ack_ep, it->ack_entry.src_addr, next_seq, pe,
                                                  &send_elem, NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK,
-                                                 it->second.ack_entry.put_count);
+                                                 it->ack_entry.put_count);
                 }
                 NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "gdrcopy_amo_ack failed\n");
             }
 
-            signal_state->proxy_put_signal_comp_map->erase(it);
+            it->valid = false;
             next_seq = (next_seq + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
         }
     }
@@ -1223,7 +1212,7 @@ static int nvshmemt_libfabric_rma(struct nvshmem_transport *tcurr, int pe, rma_v
             header = NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT;
         }
 
-        imm_data_val = ((uint32_t)header << 28) | ((uint32_t)put_ack_count << 16) | (sequence_count & 0xFFFF);
+        imm_data_val = ((uint32_t)header << 28) | ((uint32_t)put_ack_count << NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT) | (sequence_count & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK);
         imm_data = &imm_data_val;
     }
 
@@ -2060,19 +2049,23 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
     all_ep_names.resize(total_num_eps);
 
     /* Initialize state-level signal ordering state */
-    state->host_signal_state.put_signal_seq_counter_per_pe =
-        new std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t>();
-    state->host_signal_state.proxy_put_signal_comp_map =
-        new std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t>();
-    state->host_signal_state.next_expected_seq =
-        new std::unordered_map<int, uint32_t>();
+    {
+        int seq_space = NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK + 1; /* includes reserved */
 
-    state->proxy_signal_state.put_signal_seq_counter_per_pe =
-        new std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t>();
-    state->proxy_signal_state.proxy_put_signal_comp_map =
-        new std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t>();
-    state->proxy_signal_state.next_expected_seq =
-        new std::unordered_map<int, uint32_t>();
+        auto init_signal_state = [&](nvshmemt_libfabric_signal_state_t &ss) {
+            ss.num_pes = n_pes;
+            ss.seq_space = seq_space;
+            ss.put_signal_seq_counter_per_pe =
+                new std::vector<nvshmemt_libfabric_endpoint_seq_counter_t>(n_pes);
+            ss.proxy_put_signal_comp_map =
+                new std::vector<std::vector<nvshmemt_libfabric_comp_entry_t>>(
+                    n_pes, std::vector<nvshmemt_libfabric_comp_entry_t>(seq_space));
+            ss.next_expected_seq =
+                new std::vector<uint32_t>(n_pes, 0);
+        };
+        init_signal_state(state->host_signal_state);
+        init_signal_state(state->proxy_signal_state);
+    }
 
     for (size_t i = 0; i < state->prov_infos.size(); i++) {
         INFO(state->log_level, "Selected provider %s, fabric %s, nic %s, hmem %s domain %zu/%zu",
