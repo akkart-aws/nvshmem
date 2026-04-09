@@ -881,7 +881,7 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
                 do {
                     status = libfabric_state->op_queue[ack_ep->domain_index]->getNextSends(
                         (void **)(&send_elem), 1);
-                } while (try_again(transport, &status, &num_retries, ack_ep->domain_index,
+                } while (try_again(transport, &status, &num_retries, ack_ep->qp_index,
                                   NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_GDRCOPY_AMO_ACK, true));
 
                 if (status == 0) {
