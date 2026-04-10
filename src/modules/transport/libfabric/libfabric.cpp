@@ -568,7 +568,7 @@ static int nvshmemt_libfabric_gdr_complete_amos(nvshmem_transport_t transport) {
             send_elems_index++;
 
             libfabric_state->op_queue[done.ep->domain_index]->putToSend(done.send_elems[send_elems_index]);
-        } else {
+        } else if (done.send_elems[0] != NULL) {
             libfabric_state->op_queue[done.ep->domain_index]->putToSend(done.send_elems[0]);
         }
 
@@ -1005,42 +1005,37 @@ static int nvshmemt_libfabric_gdr_process_amos(nvshmem_transport_t transport, in
     int total_ops_processed = 0;
     int max_ops = libfabric_state->proxy_request_batch_max;
 
-    /* Round-robin across domains one entry at a time to preserve global
-     * per-PE sequence order. Draining one domain completely before the
-     * next batches entries by domain, causing non-contiguous sequences
-     * per PE which prevents effective ACK stash accumulation. */
-    bool any_op;
-    do {
-        any_op = false;
-        for (size_t i = 0; i < num_domains && total_ops_processed < max_ops; i++) {
-            do {
-                status = libfabric_state->op_queue[i]->getNextAmoOps(
-                    send_elems, &op, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
-            } while (try_again(
-                transport, &status, &num_retries, qp_index,
-                NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_GDR_PROCESS_AMOS_GET_NEXT_NOT_ACK, true));
-            num_retries = 0;
+    /* Drain non-signal AMO requests from per-domain op_queues.
+     * Signals bypass op_queue and go directly to signal_work_queue
+     * from put_signal_completion to preserve per-PE sequence order. */
+    for (size_t i = 0; i < num_domains && total_ops_processed < max_ops; i++) {
+        do {
+            status = libfabric_state->op_queue[i]->getNextAmoOps(
+                send_elems, &op, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
+        } while (try_again(
+            transport, &status, &num_retries, qp_index,
+            NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_GDR_PROCESS_AMOS_GET_NEXT_NOT_ACK, true));
+        num_retries = 0;
 
-            if (op) {
-                any_op = true;
-                total_ops_processed++;
-                signal_delivery_work_entry work;
-                work.op = op;
-                work.send_elems[0] = send_elems[0];
-                work.send_elems[1] = send_elems[1];
-                if (op->type == NVSHMEMT_LIBFABRIC_SEND) {
-                    work.sequence_count = NVSHMEM_STAGED_AMO_SEQ_NUM;
-                    work.preceding_put_count = 0;
-                } else {
-                    work.sequence_count = op->send_amo.sequence_count & 0xFFFF;
-                    work.preceding_put_count = (op->send_amo.sequence_count >> 16) & 0xFF;
-                }
-                while (!libfabric_state->signal_work_queue.push(work)) {
-                    nvshmemt_libfabric_gdr_complete_amos(transport);
-                }
+        if (op) {
+            total_ops_processed++;
+            signal_delivery_work_entry work;
+            work.op = op;
+            work.send_elems[0] = send_elems[0];
+            work.send_elems[1] = send_elems[1];
+            work.sequence_count = NVSHMEM_STAGED_AMO_SEQ_NUM;
+            work.preceding_put_count = 0;
+            while (libfabric_state->signal_work_queue_lock.test_and_set(std::memory_order_acquire))
+                _mm_pause();
+            while (!libfabric_state->signal_work_queue.push(work)) {
+                libfabric_state->signal_work_queue_lock.clear(std::memory_order_release);
+                nvshmemt_libfabric_gdr_complete_amos(transport);
+                while (libfabric_state->signal_work_queue_lock.test_and_set(std::memory_order_acquire))
+                    _mm_pause();
             }
+            libfabric_state->signal_work_queue_lock.clear(std::memory_order_release);
         }
-    } while (any_op && total_ops_processed < max_ops);
+    }
 
     return status;
 }
@@ -1162,9 +1157,22 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
                 if (it->signal_entry.progress_count != 0) break;
 
                 if (it->signal_entry.op != NULL) {
-                    int op_ep_idx = it->signal_entry.op->ep_index;
-                    libfabric_state->op_queue[libfabric_state->eps[op_ep_idx]->domain_index]->putToRecv(
-                        it->signal_entry.op, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
+                    nvshmemt_libfabric_gdr_op_ctx_t *sig_op = it->signal_entry.op;
+                    signal_delivery_work_entry work;
+                    work.op = sig_op;
+                    work.send_elems[0] = NULL;
+                    work.send_elems[1] = NULL;
+                    work.sequence_count = sig_op->send_amo.sequence_count & 0xFFFF;
+                    work.preceding_put_count = (sig_op->send_amo.sequence_count >> 16) & 0xFF;
+                    while (libfabric_state->signal_work_queue_lock.test_and_set(std::memory_order_acquire))
+                        _mm_pause();
+                    while (!libfabric_state->signal_work_queue.push(work)) {
+                        libfabric_state->signal_work_queue_lock.clear(std::memory_order_release);
+                        nvshmemt_libfabric_gdr_complete_amos(transport);
+                        while (libfabric_state->signal_work_queue_lock.test_and_set(std::memory_order_acquire))
+                            _mm_pause();
+                    }
+                    libfabric_state->signal_work_queue_lock.clear(std::memory_order_release);
                 }
             } else {
                 nvshmemt_libfabric_endpoint_t *ack_ep = it->ack_entry.ep;

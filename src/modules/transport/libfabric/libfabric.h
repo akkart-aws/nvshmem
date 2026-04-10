@@ -616,6 +616,7 @@ typedef struct {
     std::atomic<int> signal_delivery_stop{0};
     void *signal_delivery_transport;
     std::atomic_flag signal_queue_lock = ATOMIC_FLAG_INIT;
+    std::atomic_flag signal_work_queue_lock = ATOMIC_FLAG_INIT;
     SPSCRing<signal_delivery_work_entry> signal_work_queue;
     SPSCRing<signal_delivery_done_entry> signal_done_queue;
 
