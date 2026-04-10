@@ -489,7 +489,7 @@ class threadSafeOpQueue {
  * in the future. That is, it may be the case that eps.size() != devices.size(). The domain index
  * of an endpoint is stored directly in nvshmemt_libfabric_endpoint_t (domain_index).
  */
-#define NVSHMEMT_LIBFABRIC_ACK_MAX_AGE 64
+#define NVSHMEMT_LIBFABRIC_ACK_MAX_AGE 128
 
 struct nvshmemt_libfabric_pending_ack {
     uint16_t last_seq;
@@ -615,8 +615,8 @@ typedef struct {
     pthread_t signal_delivery_thread;
     std::atomic<int> signal_delivery_stop{0};
     void *signal_delivery_transport;
-    std::atomic_flag signal_queue_lock = ATOMIC_FLAG_INIT;
-    std::atomic_flag signal_work_queue_lock = ATOMIC_FLAG_INIT;
+    conditional_mutex signal_queue_lock;
+    conditional_mutex signal_work_queue_lock;
     SPSCRing<signal_delivery_work_entry> signal_work_queue;
     SPSCRing<signal_delivery_done_entry> signal_done_queue;
 

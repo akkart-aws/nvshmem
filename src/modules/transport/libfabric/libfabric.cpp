@@ -894,20 +894,19 @@ static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_ind
 
     if (likely(libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA)) {
         /* Serialize access to SPSC rings — both host and proxy threads may enter here */
-        while (libfabric_state->signal_queue_lock.test_and_set(std::memory_order_acquire))
-            _mm_pause();
+        libfabric_state->signal_queue_lock.lock();
 
         /* Drain done_queue first: fi_recv + ACK (free up space before enqueuing new work) */
         status = nvshmemt_libfabric_gdr_complete_amos(transport);
         if (unlikely(status)) {
-            libfabric_state->signal_queue_lock.clear(std::memory_order_release);
+            libfabric_state->signal_queue_lock.unlock();
             return NVSHMEMX_ERROR_INTERNAL;
         }
 
         /* Dequeue from op_queue, push to work_queue for signal delivery thread */
         status = nvshmemt_libfabric_gdr_process_amos(transport, progress_qp_index);
         if (unlikely(status)) {
-            libfabric_state->signal_queue_lock.clear(std::memory_order_release);
+            libfabric_state->signal_queue_lock.unlock();
             return NVSHMEMX_ERROR_INTERNAL;
         }
 
@@ -915,19 +914,19 @@ static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_ind
         if (progress_qp_index == NVSHMEMX_QP_HOST || progress_qp_index == NVSHMEMX_QP_ALL) {
             status = flush_stale_pending_acks(transport, &libfabric_state->host_signal_state);
             if (unlikely(status)) {
-                libfabric_state->signal_queue_lock.clear(std::memory_order_release);
+                libfabric_state->signal_queue_lock.unlock();
                 return NVSHMEMX_ERROR_INTERNAL;
             }
         }
         if (progress_qp_index != NVSHMEMX_QP_HOST) {
             status = flush_stale_pending_acks(transport, &libfabric_state->proxy_signal_state);
             if (unlikely(status)) {
-                libfabric_state->signal_queue_lock.clear(std::memory_order_release);
+                libfabric_state->signal_queue_lock.unlock();
                 return NVSHMEMX_ERROR_INTERNAL;
             }
         }
 
-        libfabric_state->signal_queue_lock.clear(std::memory_order_release);
+        libfabric_state->signal_queue_lock.unlock();
     }
 
     return 0;
@@ -1025,15 +1024,13 @@ static int nvshmemt_libfabric_gdr_process_amos(nvshmem_transport_t transport, in
             work.send_elems[1] = send_elems[1];
             work.sequence_count = NVSHMEM_STAGED_AMO_SEQ_NUM;
             work.preceding_put_count = 0;
-            while (libfabric_state->signal_work_queue_lock.test_and_set(std::memory_order_acquire))
-                _mm_pause();
+            libfabric_state->signal_work_queue_lock.lock();
             while (!libfabric_state->signal_work_queue.push(work)) {
-                libfabric_state->signal_work_queue_lock.clear(std::memory_order_release);
+                libfabric_state->signal_work_queue_lock.unlock();
                 nvshmemt_libfabric_gdr_complete_amos(transport);
-                while (libfabric_state->signal_work_queue_lock.test_and_set(std::memory_order_acquire))
-                    _mm_pause();
+                libfabric_state->signal_work_queue_lock.lock();
             }
-            libfabric_state->signal_work_queue_lock.clear(std::memory_order_release);
+            libfabric_state->signal_work_queue_lock.unlock();
         }
     }
 
@@ -1164,15 +1161,13 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
                     work.send_elems[1] = NULL;
                     work.sequence_count = sig_op->send_amo.sequence_count & 0xFFFF;
                     work.preceding_put_count = (sig_op->send_amo.sequence_count >> 16) & 0xFF;
-                    while (libfabric_state->signal_work_queue_lock.test_and_set(std::memory_order_acquire))
-                        _mm_pause();
+                    libfabric_state->signal_work_queue_lock.lock();
                     while (!libfabric_state->signal_work_queue.push(work)) {
-                        libfabric_state->signal_work_queue_lock.clear(std::memory_order_release);
+                        libfabric_state->signal_work_queue_lock.unlock();
                         nvshmemt_libfabric_gdr_complete_amos(transport);
-                        while (libfabric_state->signal_work_queue_lock.test_and_set(std::memory_order_acquire))
-                            _mm_pause();
+                        libfabric_state->signal_work_queue_lock.lock();
                     }
-                    libfabric_state->signal_work_queue_lock.clear(std::memory_order_release);
+                    libfabric_state->signal_work_queue_lock.unlock();
                 }
             } else {
                 nvshmemt_libfabric_endpoint_t *ack_ep = it->ack_entry.ep;
@@ -2814,6 +2809,8 @@ static int nvshmemi_libfabric_init_state(nvshmem_transport_t t, nvshmemt_libfabr
      */
     if (!status && all_infos && strstr(all_infos->fabric_attr->name, options->LIBFABRIC_PROVIDER)) {
         use_auto_progress = true;
+        state->signal_work_queue_lock.set_needs_lock(false);
+        state->signal_queue_lock.set_needs_lock(false);
     } else {
         if (all_infos) fi_freeinfo(all_infos);
 
