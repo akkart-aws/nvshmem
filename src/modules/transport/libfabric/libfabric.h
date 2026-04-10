@@ -14,6 +14,7 @@
 #include <atomic>
 #include <array>
 #include <deque>
+#include <list>
 #include <vector>
 #include <mutex>
 #include <unordered_map>
@@ -157,11 +158,6 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
      * @return -1 if no sequence number available
      */
     int32_t next_seq_num() {
-        /* Skip this sequence number if reserved */
-        if (sequence_counter == NVSHMEM_STAGED_AMO_SEQ_NUM) {
-            sequence_counter = (sequence_counter + 1) & sequence_mask;
-        }
-
         uint32_t seq_num = sequence_counter;
 
         uint32_t category = get_category(seq_num);
@@ -190,7 +186,6 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
      */
     void return_acked_range(uint32_t end_seq, uint32_t count) {
         if (count == 0) return;
-        assert(end_seq != NVSHMEM_STAGED_AMO_SEQ_NUM);
 
         uint32_t end_category = get_category(end_seq);
         uint32_t end_index = get_index(end_seq);
@@ -489,10 +484,29 @@ class threadSafeOpQueue {
  * in the future. That is, it may be the case that eps.size() != devices.size(). The domain index
  * of an endpoint is stored directly in nvshmemt_libfabric_endpoint_t (domain_index).
  */
+
+#define NVSHMEMT_LIBFABRIC_ACK_MAX_AGE 64
+
+struct nvshmemt_libfabric_pending_ack {
+    uint16_t last_seq;
+    uint8_t signal_count;
+    uint8_t preceding_put_count;
+    fi_addr_t src_addr;
+    nvshmemt_libfabric_endpoint_t *ep;
+    uint16_t age;
+    bool pending;
+    std::list<int>::iterator active_it;
+
+    nvshmemt_libfabric_pending_ack() : last_seq(0), signal_count(0),
+        preceding_put_count(0), src_addr(0), ep(nullptr), age(0), pending(false) {}
+};
+
 typedef struct {
     std::vector<nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
     std::vector<std::vector<nvshmemt_libfabric_comp_entry_t>> *proxy_put_signal_comp_map; /* [pe][seq] */
     std::vector<uint32_t> *next_expected_seq;
+    std::vector<nvshmemt_libfabric_pending_ack> *pending_acks_per_pe;
+    std::list<int> active_pending_pes;
     int num_pes{0};
     int seq_space{0};
 } nvshmemt_libfabric_signal_state_t;
@@ -589,8 +603,17 @@ typedef struct {
     std::atomic<int> signal_delivery_stop{0};
     void *signal_delivery_transport;
     std::atomic_flag signal_queue_lock = ATOMIC_FLAG_INIT;
+    std::atomic_flag signal_work_queue_lock = ATOMIC_FLAG_INIT;
     SPSCRing<signal_delivery_work_entry> signal_work_queue;
     SPSCRing<signal_delivery_done_entry> signal_done_queue;
+
+    /* Shared completed_staged_atomics counters, split by host/proxy.
+     * With ACK bundling, a single ACK may cover signals sent across
+     * different rails, so per-EP tracking is insufficient. quiet()
+     * sums submitted_ops and completed_ops across EPs in the relevant
+     * range and compares against the corresponding shared counter. */
+    uint64_t host_completed_staged_atomics{0};
+    uint64_t proxy_completed_staged_atomics{0};
 } nvshmemt_libfabric_state_t;
 
 typedef struct {
@@ -633,11 +656,12 @@ static_assert(sizeof(nvshmemt_libfabric_mem_handle_t) <= nvshmemt_libfabric_mem_
 
 /* Wire data for put-signal gdr staged atomics
  * 32 bytes
- * | 4 type | 2 op | 2 num_writes | 8 signal | 8 target_addr | 4 sequence_count | 4 resv
+ * | 4 type | 1 op | 1 ppc | 2 num_writes | 8 sig_val | 8 target_addr | 2 seq | 2 src_pe | 2 ack_seq | 1 ack_count | 1 ack_ppc
  */
 typedef struct nvshmemt_libfabric_gdr_signal_op {
-    nvshmemt_libfabric_recv_t type; /* Must be first */
-    uint16_t op;
+    nvshmemt_libfabric_recv_t type; /* Must be first — matches gdr_op_ctx_t layout */
+    uint8_t  op;
+    uint8_t  preceding_put_count;
     uint16_t num_writes;
     uint64_t sig_val;
     void *target_addr;
@@ -645,7 +669,7 @@ typedef struct nvshmemt_libfabric_gdr_signal_op {
     uint16_t src_pe;
     uint16_t ack_seq_num;
     uint8_t  ack_count;
-    uint8_t  preceding_put_count;
+    uint8_t  ack_preceding_put_count;
 } nvshmemt_libfabric_gdr_signal_op_t;
 /*  EFA's inline send size is 32 bytes */
 static_assert(sizeof(nvshmemt_libfabric_gdr_signal_op_t) == 32);
