@@ -157,11 +157,6 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
      * @return -1 if no sequence number available
      */
     int32_t next_seq_num() {
-        /* Skip this sequence number if reserved */
-        if (sequence_counter == NVSHMEM_STAGED_AMO_SEQ_NUM) {
-            sequence_counter = (sequence_counter + 1) & sequence_mask;
-        }
-
         uint32_t seq_num = sequence_counter;
 
         uint32_t category = get_category(seq_num);
@@ -190,7 +185,6 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
      */
     void return_acked_range(uint32_t end_seq, uint32_t count) {
         if (count == 0) return;
-        assert(end_seq != NVSHMEM_STAGED_AMO_SEQ_NUM);
 
         uint32_t end_category = get_category(end_seq);
         uint32_t end_index = get_index(end_seq);

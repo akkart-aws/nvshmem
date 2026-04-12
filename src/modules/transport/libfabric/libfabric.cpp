@@ -353,23 +353,9 @@ static int stash_or_flush_ack(nvshmem_transport_t transport,
     /* Already have a stashed ACK — check if we can extend it */
     constexpr uint32_t seq_mask = nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
     uint32_t expected = (pending.last_seq + 1) & seq_mask;
-    if (expected == NVSHMEM_STAGED_AMO_SEQ_NUM)
-        expected = (expected + 1) & seq_mask;
 
-    /* first_seq of new range = last_seq - signal_count + 1 (accounting for ppc) */
-    uint32_t new_first_seq = last_seq;
-    for (int i = 1; i < signal_count; i++) {
-        new_first_seq = (new_first_seq - 1) & seq_mask;
-        if (new_first_seq == NVSHMEM_STAGED_AMO_SEQ_NUM)
-            new_first_seq = (new_first_seq - 1) & seq_mask;
-    }
-    /* Account for preceding puts between stashed range and new range */
-    uint32_t new_first_with_ppc = new_first_seq;
-    for (int i = 0; i < preceding_put_count; i++) {
-        new_first_with_ppc = (new_first_with_ppc - 1) & seq_mask;
-        if (new_first_with_ppc == NVSHMEM_STAGED_AMO_SEQ_NUM)
-            new_first_with_ppc = (new_first_with_ppc - 1) & seq_mask;
-    }
+    uint32_t new_first_seq = (last_seq - signal_count + 1) & seq_mask;
+    uint32_t new_first_with_ppc = (new_first_seq - preceding_put_count) & seq_mask;
 
     bool contiguous = (new_first_with_ppc == expected) || (preceding_put_count == 0 && new_first_seq == expected);
     bool fits = (pending.signal_count + signal_count) <= 63;
@@ -574,11 +560,29 @@ static int nvshmemt_libfabric_gdr_complete_amos(nvshmem_transport_t transport) {
             libfabric_state->op_queue[done.ep->domain_index]->putToSend(done.send_elems[0]);
         }
 
-        status = stash_or_flush_ack(transport, signal_state, done.src_pe,
-                                    done.sequence_count & 0xFFFF, 1,
-                                    (done.sequence_count >> 16) & 0xFF,
-                                    done.ep, done.src_addr);
-        NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to stash ack.\n");
+        if (done.send_elems[0] == NULL) {
+            /* Signal: go through stash/piggyback path */
+            status = stash_or_flush_ack(transport, signal_state, done.src_pe,
+                                        done.sequence_count & 0xFFFF, 1,
+                                        (done.sequence_count >> 16) & 0xFF,
+                                        done.ep, done.src_addr);
+            NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to stash ack.\n");
+        } else {
+            /* AMO: send ACK immediately with signal_count=0 */
+            nvshmemt_libfabric_gdr_op_ctx_t *ack_send_elem = NULL;
+            uint64_t num_ack_retries = 0;
+            do {
+                status = libfabric_state->op_queue[done.ep->domain_index]->getNextSends(
+                    (void **)&ack_send_elem, 1);
+            } while (try_again(transport, &status, &num_ack_retries, done.ep->domain_index,
+                               NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_GDRCOPY_AMO_ACK, true));
+            if (status == 0) {
+                status = gdrcopy_amo_ack(transport, *done.ep, done.src_addr,
+                                         0, done.src_pe, &ack_send_elem,
+                                         NVSHMEMT_LIBFABRIC_IMM_STAGED_ATOMIC_ACK, 0, 0);
+            }
+            NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to send AMO ack.\n");
+        }
     }
 
 out:
@@ -619,7 +623,7 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
     uint8_t preceding_put_count = ((uint32_t)entry->data >> NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT) & 0xFF;
     uint8_t signal_count = ((uint32_t)entry->data >> 22) & 0x3F;
 
-    if (seq_num != NVSHMEM_STAGED_AMO_SEQ_NUM) {
+    if (signal_count > 0 || preceding_put_count > 0) {
         /* Use host_signal_state for eps[0], proxy_signal_state for eps[1+] */
         nvshmemt_libfabric_signal_state_t *signal_state =
             (ep.domain_index == 0) ? &state->host_signal_state : &state->proxy_signal_state;
@@ -633,23 +637,23 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
             /* Put ACK: decrement by the put batch count */
             seq_counter.return_acked_range(seq_num, preceding_put_count);
         } else {
-            /* Signal/AMO ACK: decrement preceding puts + the signal(s) */
+            /* Signal ACK: decrement preceding puts + the signal(s) */
             if (preceding_put_count > 0) {
                 uint32_t first_sig_seq = (seq_num - signal_count + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
                 uint32_t last_put_seq = (first_sig_seq - 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
-                if (last_put_seq == NVSHMEM_STAGED_AMO_SEQ_NUM)
-                    last_put_seq = (last_put_seq - 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
                 seq_counter.return_acked_range(last_put_seq, preceding_put_count);
             }
             seq_counter.return_acked_range(seq_num, signal_count);
         }
     }
 
-    ep.completed_staged_atomics += signal_count;
+    /* Signal ACKs: count by signal_count. AMO/Put ACKs (signal_count=0): count 1. */
+    uint8_t completion_count = (signal_count > 0) ? signal_count : 1;
+    ep.completed_staged_atomics += completion_count;
     if (ep.domain_index < state->num_host_domains)
-        state->host_completed_staged_atomics += signal_count;
+        state->host_completed_staged_atomics += completion_count;
     else
-        state->proxy_completed_staged_atomics += signal_count;
+        state->proxy_completed_staged_atomics += completion_count;
 }
 
 static inline bool is_signal_only_op(nvshmemi_amo_t op) {
@@ -1095,8 +1099,6 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
             if (piggyback_ack_ppc > 0) {
                 uint32_t first_sig_seq = (piggyback_ack_seq - piggyback_ack_count + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
                 uint32_t last_put_seq = (first_sig_seq - 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
-                if (last_put_seq == NVSHMEM_STAGED_AMO_SEQ_NUM)
-                    last_put_seq = (last_put_seq - 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
                 seq_counter.return_acked_range(last_put_seq, piggyback_ack_ppc);
             }
             seq_counter.return_acked_range(piggyback_ack_seq, piggyback_ack_count);
@@ -1142,12 +1144,6 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
         uint32_t &next_seq = (*signal_state->next_expected_seq)[pe];
 
         while (true) {
-            // Skip reserved sequence number
-            if (next_seq == NVSHMEM_STAGED_AMO_SEQ_NUM) {
-                next_seq = (next_seq + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
-                continue;
-            }
-
             nvshmemt_libfabric_comp_entry_t *it = &(*signal_state->proxy_put_signal_comp_map)[pe][next_seq];
 
             if (!it->valid) break;
@@ -1184,7 +1180,7 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
                 if (status == 0) {
                     status = gdrcopy_amo_ack(transport, *ack_ep, it->ack_entry.src_addr, next_seq, pe,
                                                  &send_elem, NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK,
-                                                 it->ack_entry.put_count);
+                                                 it->ack_entry.put_count, 0);
                 }
                 NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "gdrcopy_amo_ack failed\n");
             }
