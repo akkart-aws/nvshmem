@@ -484,8 +484,8 @@ class threadSafeOpQueue {
  * in the future. That is, it may be the case that eps.size() != devices.size(). The domain index
  * of an endpoint is stored directly in nvshmemt_libfabric_endpoint_t (domain_index).
  */
-#define NVSHMEMT_LIBFABRIC_ACK_MAX_AGE 32
-#define NVSHMEMT_LIBFABRIC_ACK_STATS 0
+#define NVSHMEMT_LIBFABRIC_ACK_MAX_AGE 128
+#define NVSHMEMT_LIBFABRIC_ACK_STATS 1
 
 struct nvshmemt_libfabric_pending_ack {
     uint16_t last_seq;

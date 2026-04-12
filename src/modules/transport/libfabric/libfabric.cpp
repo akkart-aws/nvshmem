@@ -362,12 +362,14 @@ static int stash_or_flush_ack(nvshmem_transport_t transport,
     uint32_t new_first_with_ppc = (new_first_seq - preceding_put_count) & seq_mask;
 
     bool contiguous = (new_first_with_ppc == expected) || (preceding_put_count == 0 && new_first_seq == expected);
-    bool fits = (pending.signal_count + signal_count) <= 63;
+    bool sig_fits = (pending.signal_count + signal_count) <= 63;
+    bool ppc_fits = (pending.preceding_put_count + preceding_put_count) <= 255;
 
-    if (contiguous && fits && preceding_put_count == 0) {
-        /* Extend existing stash */
+    if (contiguous && sig_fits && ppc_fits) {
+        /* Extend existing stash — accumulate both signals and puts */
         pending.last_seq = last_seq;
         pending.signal_count += signal_count;
+        pending.preceding_put_count += preceding_put_count;
         pending.age = 0;
         return 0;
     }
@@ -646,13 +648,8 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
             /* Put ACK: decrement by the put batch count */
             seq_counter.return_acked_range(seq_num, preceding_put_count);
         } else {
-            /* Signal ACK: decrement preceding puts + the signal(s) */
-            if (preceding_put_count > 0) {
-                uint32_t first_sig_seq = (seq_num - signal_count + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
-                uint32_t last_put_seq = (first_sig_seq - 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
-                seq_counter.return_acked_range(last_put_seq, preceding_put_count);
-            }
-            seq_counter.return_acked_range(seq_num, signal_count);
+            /* Signal ACK: free entire range (interleaved puts + signals) */
+            seq_counter.return_acked_range(seq_num, signal_count + preceding_put_count);
         }
     }
 
@@ -1105,12 +1102,7 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
                     ? &libfabric_state->host_signal_state
                     : &libfabric_state->proxy_signal_state;
             auto &seq_counter = (*local_signal_state->put_signal_seq_counter_per_pe)[pe];
-            if (piggyback_ack_ppc > 0) {
-                uint32_t first_sig_seq = (piggyback_ack_seq - piggyback_ack_count + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
-                uint32_t last_put_seq = (first_sig_seq - 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
-                seq_counter.return_acked_range(last_put_seq, piggyback_ack_ppc);
-            }
-            seq_counter.return_acked_range(piggyback_ack_seq, piggyback_ack_count);
+            seq_counter.return_acked_range(piggyback_ack_seq, piggyback_ack_count + piggyback_ack_ppc);
             if (ep.domain_index < libfabric_state->num_host_domains)
                 libfabric_state->host_completed_staged_atomics += piggyback_ack_count;
             else
