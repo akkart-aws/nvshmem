@@ -309,6 +309,7 @@ static int flush_pending_ack(nvshmem_transport_t transport,
     if (status) return status;
 
     if (signal_state) {
+#if NVSHMEMT_LIBFABRIC_ACK_STATS
         if (is_stale)
             signal_state->acks_flushed_stale += pending.signal_count;
         else
@@ -316,6 +317,7 @@ static int flush_pending_ack(nvshmem_transport_t transport,
         signal_state->flush_count++;
         signal_state->flush_sig_hist[std::min((int)pending.signal_count, 63)]++;
         signal_state->flush_ppc_hist[std::min((int)pending.preceding_put_count, 63)]++;
+#endif
     }
 
     status = gdrcopy_amo_ack(transport, *pending.ep, pending.src_addr,
@@ -1724,10 +1726,12 @@ static int nvshmemt_libfabric_gdr_signal(struct nvshmem_transport *transport, in
             signal->ack_seq_num = pending.last_seq;
             signal->ack_count = pending.signal_count;
             signal->ack_preceding_put_count = pending.preceding_put_count;
+#if NVSHMEMT_LIBFABRIC_ACK_STATS
             signal_state->acks_piggybacked += pending.signal_count;
             signal_state->piggyback_count++;
             signal_state->piggyback_sig_hist[std::min((int)pending.signal_count, 63)]++;
             signal_state->piggyback_ppc_hist[std::min((int)pending.preceding_put_count, 63)]++;
+#endif
             pending.pending = false;
             pending.signal_count = 0;
             pending.age = 0;
@@ -2601,6 +2605,7 @@ static int nvshmemt_libfabric_finalize(nvshmem_transport_t transport) {
         pthread_join(libfabric_state->signal_delivery_thread, NULL);
 
         /* Print ACK stats for both host and proxy signal states */
+#if NVSHMEMT_LIBFABRIC_ACK_STATS
         for (int qp = 0; qp < 2; qp++) {
             nvshmemt_libfabric_signal_state_t *ss =
                 (qp == 0) ? &libfabric_state->host_signal_state
@@ -2643,6 +2648,7 @@ static int nvshmemt_libfabric_finalize(nvshmem_transport_t transport) {
             print_hist("flush sig_count", ss->flush_sig_hist);
             print_hist("flush ppc", ss->flush_ppc_hist);
         }
+#endif
     }
 
     if (transport->device_pci_paths) {

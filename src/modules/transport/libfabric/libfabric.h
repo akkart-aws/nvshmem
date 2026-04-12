@@ -490,6 +490,7 @@ class threadSafeOpQueue {
  * of an endpoint is stored directly in nvshmemt_libfabric_endpoint_t (domain_index).
  */
 #define NVSHMEMT_LIBFABRIC_ACK_MAX_AGE 128
+#define NVSHMEMT_LIBFABRIC_ACK_STATS 0
 
 struct nvshmemt_libfabric_pending_ack {
     uint16_t last_seq;
@@ -512,6 +513,7 @@ typedef struct {
     int num_pes{0};
     int seq_space{0};
     /* ACK stats */
+#if NVSHMEMT_LIBFABRIC_ACK_STATS
     uint64_t acks_piggybacked{0};       /* signals piggybacked on outgoing signals */
     uint64_t acks_flushed_stale{0};     /* signals flushed by age expiry */
     uint64_t acks_flushed_noncontig{0}; /* signals flushed by non-contiguous stash */
@@ -522,6 +524,7 @@ typedef struct {
     uint64_t flush_sig_hist[64]{};      /* flush signal_count distribution */
     uint64_t piggyback_ppc_hist[64]{};  /* piggyback preceding_put_count distribution (capped at 63) */
     uint64_t flush_ppc_hist[64]{};      /* flush preceding_put_count distribution (capped at 63) */
+#endif
 } nvshmemt_libfabric_signal_state_t;
 
 struct signal_delivery_work_entry {
