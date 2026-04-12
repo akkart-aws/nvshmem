@@ -14,6 +14,7 @@
 #include <atomic>
 #include <array>
 #include <deque>
+#include <list>
 #include <vector>
 #include <mutex>
 #include <unordered_map>
@@ -483,7 +484,7 @@ class threadSafeOpQueue {
  * in the future. That is, it may be the case that eps.size() != devices.size(). The domain index
  * of an endpoint is stored directly in nvshmemt_libfabric_endpoint_t (domain_index).
  */
-#define NVSHMEMT_LIBFABRIC_ACK_MAX_AGE 128
+#define NVSHMEMT_LIBFABRIC_ACK_MAX_AGE 32
 #define NVSHMEMT_LIBFABRIC_ACK_STATS 0
 
 struct nvshmemt_libfabric_pending_ack {
@@ -494,6 +495,7 @@ struct nvshmemt_libfabric_pending_ack {
     nvshmemt_libfabric_endpoint_t *ep;
     uint16_t age;
     bool pending;
+    std::list<int>::iterator active_it;
 
     nvshmemt_libfabric_pending_ack() : last_seq(0), signal_count(0),
         preceding_put_count(0), src_addr(0), ep(nullptr), age(0), pending(false) {}
@@ -504,6 +506,7 @@ typedef struct {
     std::vector<std::vector<nvshmemt_libfabric_comp_entry_t>> *proxy_put_signal_comp_map; /* [pe][seq] */
     std::vector<uint32_t> *next_expected_seq;
     std::vector<nvshmemt_libfabric_pending_ack> *pending_acks_per_pe;
+    std::list<int> active_pending_pes;
     int num_pes{0};
     int seq_space{0};
     /* ACK stats */

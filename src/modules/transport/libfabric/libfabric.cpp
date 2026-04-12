@@ -327,6 +327,8 @@ static int flush_pending_ack(nvshmem_transport_t transport,
     pending.pending = false;
     pending.signal_count = 0;
     pending.age = 0;
+    if (signal_state)
+        signal_state->active_pending_pes.erase(pending.active_it);
     return status;
 }
 
@@ -347,6 +349,8 @@ static int stash_or_flush_ack(nvshmem_transport_t transport,
         pending.src_addr = src_addr;
         pending.age = 0;
         pending.pending = true;
+        signal_state->active_pending_pes.push_back(src_pe);
+        pending.active_it = std::prev(signal_state->active_pending_pes.end());
         return 0;
     }
 
@@ -379,6 +383,8 @@ static int stash_or_flush_ack(nvshmem_transport_t transport,
     pending.src_addr = src_addr;
     pending.age = 0;
     pending.pending = true;
+    signal_state->active_pending_pes.push_back(src_pe);
+    pending.active_it = std::prev(signal_state->active_pending_pes.end());
     return 0;
 }
 
@@ -387,14 +393,17 @@ static int flush_stale_pending_acks(nvshmem_transport_t transport,
     int status = 0;
     if (!signal_state->pending_acks_per_pe) return 0;
 
-    for (int i = 0; i < signal_state->num_pes; i++) {
-        auto &pending = (*signal_state->pending_acks_per_pe)[i];
-        if (pending.pending) {
-            pending.age++;
-            if (pending.age >= NVSHMEMT_LIBFABRIC_ACK_MAX_AGE) {
-                status = flush_pending_ack(transport, pending, signal_state, true);
-                if (status) return status;
-            }
+    for (auto it = signal_state->active_pending_pes.begin();
+         it != signal_state->active_pending_pes.end(); ) {
+        auto &pending = (*signal_state->pending_acks_per_pe)[*it];
+        pending.age++;
+        if (pending.age >= NVSHMEMT_LIBFABRIC_ACK_MAX_AGE) {
+            auto next = std::next(it);
+            status = flush_pending_ack(transport, pending, signal_state, true);
+            if (status) return status;
+            it = next;
+        } else {
+            ++it;
         }
     }
     return 0;
@@ -1199,12 +1208,11 @@ static int flush_all_pending_acks(nvshmem_transport_t transport,
     int status = 0;
     if (!signal_state->pending_acks_per_pe) return 0;
 
-    for (int i = 0; i < signal_state->num_pes; i++) {
-        auto &pending = (*signal_state->pending_acks_per_pe)[i];
-        if (pending.pending) {
-            status = flush_pending_ack(transport, pending, signal_state, true);
-            if (status) return status;
-        }
+    while (!signal_state->active_pending_pes.empty()) {
+        int pe = signal_state->active_pending_pes.front();
+        auto &pending = (*signal_state->pending_acks_per_pe)[pe];
+        status = flush_pending_ack(transport, pending, signal_state, true);
+        if (status) return status;
     }
     return 0;
 }
@@ -1731,6 +1739,7 @@ static int nvshmemt_libfabric_gdr_signal(struct nvshmem_transport *transport, in
             pending.pending = false;
             pending.signal_count = 0;
             pending.age = 0;
+            signal_state->active_pending_pes.erase(pending.active_it);
         } else {
             signal->ack_seq_num = 0;
             signal->ack_count = 0;
@@ -2932,6 +2941,8 @@ int nvshmemt_init(nvshmem_transport_t *t, struct nvshmemi_cuda_fn_table *table, 
                             "Unable to allocate memory for libfabric transport state.");
     new (&libfabric_state->signal_work_queue) SPSCRing<signal_delivery_work_entry>();
     new (&libfabric_state->signal_done_queue) SPSCRing<signal_delivery_done_entry>();
+    new (&libfabric_state->host_signal_state) nvshmemt_libfabric_signal_state_t();
+    new (&libfabric_state->proxy_signal_state) nvshmemt_libfabric_signal_state_t();
     libfabric_state->table = table;
     transport->state = libfabric_state;
 
