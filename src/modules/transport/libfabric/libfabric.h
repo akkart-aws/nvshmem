@@ -395,10 +395,10 @@ class threadSafeOpQueue {
    private:
     conditional_mutex send_mutex;
     conditional_mutex ack_recv_mutex;
-    conditional_mutex other_recv_mutex;
+    conditional_mutex amo_recv_mutex;
     std::vector<void *> send;
     std::deque<void *> ack_recv;
-    std::deque<void *> other_recv;
+    std::deque<void *> amo_recv;
 
    public:
     threadSafeOpQueue() = default;
@@ -411,7 +411,7 @@ class threadSafeOpQueue {
     void set_auto_progress(bool auto_progress) {
         send_mutex.set_needs_lock(!auto_progress);
         ack_recv_mutex.set_needs_lock(!auto_progress);
-        other_recv_mutex.set_needs_lock(!auto_progress);
+        amo_recv_mutex.set_needs_lock(!auto_progress);
     }
 
     int getNextSends(void **elems, size_t num_elems = 1) {
@@ -437,12 +437,12 @@ class threadSafeOpQueue {
         int num_sends = 0;
 
         if (recv_type == NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK) {
-            const std::lock_guard<conditional_mutex> lg{other_recv_mutex};
-            if (other_recv.empty()) {
+            const std::lock_guard<conditional_mutex> lg{amo_recv_mutex};
+            if (amo_recv.empty()) {
                 *recv_elem = NULL;
                 return 0;
             }
-            *recv_elem = (nvshmemt_libfabric_gdr_op_ctx_t *)other_recv.front();
+            *recv_elem = (nvshmemt_libfabric_gdr_op_ctx_t *)amo_recv.front();
             if ((&((*recv_elem)->send_amo))->op > NVSHMEMI_AMO_END_OF_NONFETCH) {
                 num_sends = 2;
             } else {
@@ -457,7 +457,7 @@ class threadSafeOpQueue {
             for (int i = 0; i < num_sends; i++) {
                 assert(send_elems[i] != NULL);
             }
-            other_recv.pop_front();
+            amo_recv.pop_front();
             return 0;
         } else if (recv_type == NVSHMEMT_LIBFABRIC_RECV_TYPE_ACK) {
             const std::lock_guard<conditional_mutex> lg{ack_recv_mutex};
@@ -503,12 +503,12 @@ class threadSafeOpQueue {
             ack_recv.pop_front();
             return elem;
         } else {
-            const std::lock_guard<conditional_mutex> lg{other_recv_mutex};
-            if (other_recv.empty()) {
+            const std::lock_guard<conditional_mutex> lg{amo_recv_mutex};
+            if (amo_recv.empty()) {
                 return NULL;
             }
-            elem = other_recv.front();
-            other_recv.pop_front();
+            elem = amo_recv.front();
+            amo_recv.pop_front();
             return elem;
         }
     }
@@ -518,8 +518,8 @@ class threadSafeOpQueue {
             const std::lock_guard<conditional_mutex> lg{ack_recv_mutex};
             ack_recv.push_back(elem);
         } else if (recv_type == NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK) {
-            const std::lock_guard<conditional_mutex> lg{other_recv_mutex};
-            other_recv.push_back(elem);
+            const std::lock_guard<conditional_mutex> lg{amo_recv_mutex};
+            amo_recv.push_back(elem);
         } else {
             fprintf(stderr, "putToRecv: invalid recv_type: %d\n", recv_type);
             assert(false);
@@ -672,8 +672,8 @@ typedef struct {
     pthread_t signal_delivery_thread;
     std::atomic<int> signal_delivery_stop{0};
     nvshmem_transport_t signal_delivery_transport;
-    std::atomic<int> signal_work_futex{0};
-    std::atomic_flag signal_queue_lock = ATOMIC_FLAG_INIT;
+    std::atomic<int> signal_delivery_futex{0};
+    std::atomic_flag signal_progress_lock = ATOMIC_FLAG_INIT;
     SPSCRing<signal_delivery_work_entry> signal_work_queue;
     SPSCRing<signal_delivery_done_entry> signal_done_queue;
 } nvshmemt_libfabric_state_t;

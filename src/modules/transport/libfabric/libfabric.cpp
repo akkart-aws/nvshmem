@@ -710,10 +710,10 @@ static void *nvshmemt_libfabric_signal_delivery_thread(void *arg) {
     }
     while (!state->signal_delivery_stop.load(std::memory_order_relaxed)) {
         if (!state->signal_work_queue.pop(work)) {
-            state->signal_work_futex.store(0, std::memory_order_release);
+            state->signal_delivery_futex.store(0, std::memory_order_release);
             /* Re-check after store to avoid missed wake */
             if (!state->signal_work_queue.pop(work)) {
-                syscall(SYS_futex, &state->signal_work_futex, FUTEX_WAIT, 0, NULL, NULL, 0);
+                syscall(SYS_futex, &state->signal_delivery_futex, FUTEX_WAIT, 0, NULL, NULL, 0);
                 continue;
             }
         }
@@ -736,26 +736,26 @@ static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_ind
 
     if (likely(libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA)) {
         /* Serialize access to SPSC rings — both host and proxy threads may enter here */
-        while (libfabric_state->signal_queue_lock.test_and_set(std::memory_order_acquire))
+        while (libfabric_state->signal_progress_lock.test_and_set(std::memory_order_acquire))
             NVSHMEMT_LIBFABRIC_CPU_RELAX();
 
         /* Drain done_queue first: fi_recv + ACK (free up space before enqueuing new work) */
         status = nvshmemt_libfabric_gdr_complete_amos(transport);
         if (unlikely(status)) {
-            libfabric_state->signal_queue_lock.clear(std::memory_order_release);
+            libfabric_state->signal_progress_lock.clear(std::memory_order_release);
             return NVSHMEMX_ERROR_INTERNAL;
         }
 
         /* Dequeue from op_queue, push to work_queue for signal delivery thread */
         status = nvshmemt_libfabric_gdr_process_amos(transport, progress_qp_index);
-        libfabric_state->signal_queue_lock.clear(std::memory_order_release);
+        libfabric_state->signal_progress_lock.clear(std::memory_order_release);
         if (unlikely(status)) {
             return NVSHMEMX_ERROR_INTERNAL;
         }
 
         /* Wake Thread B only if it might be sleeping (futex was 0) */
-        if (libfabric_state->signal_work_futex.exchange(1, std::memory_order_release) == 0) {
-            syscall(SYS_futex, &libfabric_state->signal_work_futex, FUTEX_WAKE, 1, NULL, NULL, 0);
+        if (libfabric_state->signal_delivery_futex.exchange(1, std::memory_order_release) == 0) {
+            syscall(SYS_futex, &libfabric_state->signal_delivery_futex, FUTEX_WAKE, 1, NULL, NULL, 0);
         }
     }
 
@@ -2304,8 +2304,8 @@ static int nvshmemt_libfabric_finalize(nvshmem_transport_t transport) {
     /* Stop signal delivery thread before tearing down resources */
     if (use_staged_atomics && libfabric_state->signal_delivery_transport) {
         libfabric_state->signal_delivery_stop.store(1, std::memory_order_seq_cst);
-        libfabric_state->signal_work_futex.store(1, std::memory_order_release);
-        syscall(SYS_futex, &libfabric_state->signal_work_futex, FUTEX_WAKE, 1, NULL, NULL, 0);
+        libfabric_state->signal_delivery_futex.store(1, std::memory_order_release);
+        syscall(SYS_futex, &libfabric_state->signal_delivery_futex, FUTEX_WAKE, 1, NULL, NULL, 0);
         pthread_join(libfabric_state->signal_delivery_thread, NULL);
     }
 
