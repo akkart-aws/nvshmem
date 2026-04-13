@@ -100,6 +100,8 @@ typedef struct nvshmemt_libfabric_gdr_op_ctx nvshmemt_libfabric_gdr_op_ctx_t;
  */
 #define NVSHMEM_STAGED_AMO_SEQ_NUM NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK
 
+#define NVSHMEMT_LIBFABRIC_SIGNAL_QUEUE_CAPACITY 1024
+
 /**
  * Type used for tracking sequence numbers for put-signal operations
  *
@@ -602,7 +604,7 @@ struct signal_delivery_done_entry {
     void *ret_addr;
 };
 
-template <typename T, int CAPACITY = 1024>
+template <typename T, int CAPACITY = NVSHMEMT_LIBFABRIC_SIGNAL_QUEUE_CAPACITY>
 class SPSCRing {
     T ring[CAPACITY];
     alignas(64) std::atomic<int> head{0};
@@ -674,8 +676,8 @@ typedef struct {
     nvshmem_transport_t signal_delivery_transport;
     std::atomic<int> signal_delivery_futex{0};
     std::atomic_flag signal_progress_lock = ATOMIC_FLAG_INIT;
-    SPSCRing<signal_delivery_work_entry> signal_work_queue;
     SPSCRing<signal_delivery_done_entry> signal_done_queue;
+    SPSCRing<signal_delivery_work_entry> signal_work_queue;
 } nvshmemt_libfabric_state_t;
 
 typedef struct {
